@@ -14,7 +14,7 @@ on:
         required: true
 
 jobs:
-  build: 
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,7 +24,8 @@ jobs:
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
-          version: latest
+          # Usamos una versión fija para evitar el error "unable to get latest version"
+          version: 0.35.3
 
       - name: Setup ESP32 core
         run: |
