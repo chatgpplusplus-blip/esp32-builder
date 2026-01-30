@@ -1,17 +1,12 @@
-#include <Arduino.h>
-
-const int LED_PIN = 2;
+#include "core_ota.h"
+#include "user_app.h"
 
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("=== BUILD TEST desde GitHub Actions ===");
-  pinMode(LED_PIN, OUTPUT);
+  CoreSetup();   // WiFi + MQTT + OTA
+  UserSetup();   // Lógica de aplicación
 }
 
 void loop() {
-  digitalWrite(LED_PIN, HIGH);
-  delay(300);
-  digitalWrite(LED_PIN, LOW);
-  delay(300);
+  CoreLoop();    // Heartbeat, MQTT, OTA
+  UserLoop();    // Tu lógica (setup/loop de aplicación)
 }
