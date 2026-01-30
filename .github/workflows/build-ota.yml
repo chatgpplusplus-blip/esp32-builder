@@ -23,6 +23,8 @@ jobs:
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
+        with:
+          version: latest
 
       - name: Setup ESP32 core
         run: |
@@ -31,24 +33,44 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      - name: Inyectar WiFi y user_app.cpp
+      - name: Install required Arduino libraries
         run: |
-          # Sobrescribir config_wifi.h con SSID/PASS recibidos
-          cat << EOF > sketch/config_wifi.h
-          #pragma once
-          #define WIFI_SSID "${{ github.event.inputs.ssid }}"
-          #define WIFI_PASS "${{ github.event.inputs.pass }}"
-          EOF
+          arduino-cli lib install "PubSubClient"
+
+      - name: Inyectar WiFi y user_app.cpp
+        env:
+          WIFI_SSID: ${{ github.event.inputs.ssid }}
+          WIFI_PASS: ${{ github.event.inputs.pass }}
+          CODE_B64: ${{ github.event.inputs.code_b64 }}
+        run: |
+          mkdir -p sketch
+
+          # Crear config_wifi.h con las credenciales WiFi
+          echo '#pragma once' > sketch/config_wifi.h
+          echo '#define WIFI_SSID "'$WIFI_SSID'"' >> sketch/config_wifi.h
+          echo '#define WIFI_PASS "'$WIFI_PASS'"' >> sketch/config_wifi.h
 
           # Crear user_app.cpp desde base64
-          echo "${{ github.event.inputs.code_b64 }}" | base64 -d > sketch/user_app.cpp
+          echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
 
       - name: Compilar sketch
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch
 
+      - name: Preparar firmware como archivo de salida
+        run: |
+          # Buscar el .bin generado por arduino-cli
+          BIN_PATH=$(find . -path "*sketch.ino.bin" -o -path "*sketch.bin" | head -n 1)
+          echo "BIN_PATH=$BIN_PATH"
+          if [ -z "$BIN_PATH" ]; then
+            echo "No se encontró firmware .bin"
+            exit 1
+          fi
+          mkdir -p out
+          cp "$BIN_PATH" out/firmware.bin
+
       - name: Subir firmware como artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware
-          path: sketch/build/esp32.esp32.esp32da/sketch.ino.bin
+          path: out/firmware.bin
