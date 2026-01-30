@@ -1,4 +1,4 @@
-name: Build ESP32 OTA firmware
+﻿name: Build ESP32 OTA firmware
 
 on:
   workflow_dispatch:
@@ -17,35 +17,37 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      ARDUINO_CLI_VERSION: "0.35.3"
+      ESP32_CORE_VERSION: "3.3.6"
+      BUILD_CACHE_DIR: ".arduino-build-cache"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Cache Arduino (core + tools + build cache)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/.cache/arduino
+            ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-v1
+          restore-keys: |
+            ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-
+
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
-          # Usamos una versión fija para evitar el error "unable to get latest version"
           version: 0.35.3
 
-      - name: Setup ESP32 core
+      - name: Setup ESP32 core (pinned)
         run: |
           arduino-cli config init
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
-
-      - name: Listar boards ESP32 disponibles (debug)
-        run: |
-          arduino-cli board listall esp32:esp32 | head -n 80
-
-      - name: Descargar PubSubClient y copiarlo a sketch
-        run: |
-          mkdir -p lib
-          git clone https://github.com/knolleary/pubsubclient.git lib/PubSubClient
-          mkdir -p sketch
-          cp lib/PubSubClient/src/PubSubClient.* sketch/
-          echo "Contenido de sketch tras copiar PubSubClient:"
-          ls -R sketch
+          arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
 
       - name: Inyectar WiFi y user_app.cpp
         env:
@@ -54,15 +56,10 @@ jobs:
           CODE_B64: ${{ github.event.inputs.code_b64 }}
         run: |
           mkdir -p sketch
-
-          # Crear config_wifi.h con las credenciales WiFi
           echo '#pragma once' > sketch/config_wifi.h
           echo '#define WIFI_SSID "'$WIFI_SSID'"' >> sketch/config_wifi.h
           echo '#define WIFI_PASS "'$WIFI_PASS'"' >> sketch/config_wifi.h
-
-          # Crear user_app.cpp desde base64
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
-
           echo "Archivos en sketch después de inyectar user_app:"
           ls -R sketch
 
@@ -70,7 +67,6 @@ jobs:
         run: |
           echo "Normalizando user_app.cpp..."
 
-          # Si el usuario mandó un sketch completo con setup/loop, lo convertimos a UserSetup/UserLoop
           if grep -qE '^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(' sketch/user_app.cpp; then
             echo "Detectado: void setup() -> renombrando a void UserSetup()"
             sed -i -E 's/^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(/void UserSetup(/' sketch/user_app.cpp
@@ -81,34 +77,29 @@ jobs:
             sed -i -E 's/^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(/void UserLoop(/' sketch/user_app.cpp
           fi
 
-          # Validación: deben existir UserSetup y UserLoop
           if ! grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp; then
             echo "ERROR: user_app.cpp no define UserSetup()."
-            echo "Asegúrate de mandar UserSetup/UserLoop o setup/loop (que se convertirá)."
             exit 1
           fi
 
           if ! grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp; then
             echo "ERROR: user_app.cpp no define UserLoop()."
-            echo "Asegúrate de mandar UserSetup/UserLoop o setup/loop (que se convertirá)."
             exit 1
           fi
 
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-      - name: Compilar sketch
+      - name: Compilar sketch (con build cache)
         run: |
-          # Mantengo tu FQBN para no romperte nada (ya que lo reconoce).
-          arduino-cli compile --fqbn esp32:esp32:esp32da sketch --output-dir build
+          mkdir -p ${BUILD_CACHE_DIR}
+          arduino-cli compile --fqbn esp32:esp32:esp32da sketch --output-dir build --build-cache-path ${BUILD_CACHE_DIR}
           echo "Contenido de build/"
           ls -la build
 
       - name: Preparar firmware como archivo de salida
         run: |
-          # Preferimos el bin principal de la app (normalmente *sketch.ino.bin*)
           BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
 
-          # Fallback: si no existe con ese nombre, agarramos el primer .bin que NO sea bootloader/partitions
           if [ -z "$BIN_PATH" ]; then
             BIN_PATH=$(find build -maxdepth 1 -type f -name "*.bin" \
               ! -name "*bootloader*" ! -name "*partitions*" | head -n 1)
@@ -117,7 +108,6 @@ jobs:
           echo "BIN_PATH=$BIN_PATH"
           if [ -z "$BIN_PATH" ]; then
             echo "No se encontró firmware .bin en build/"
-            echo "Listado de build:"
             ls -la build
             exit 1
           fi
