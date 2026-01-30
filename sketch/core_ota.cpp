@@ -5,7 +5,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
-#include <HTTPUpdate.h>
+#include <HTTPClient.h>
+#include <Update.h>
 
 #define MQTT_MAX_PACKET_SIZE 2048
 
@@ -44,54 +45,116 @@ void publishLog(const String& msg) {
   publishTopic(T("log"), msg, false);
 }
 
-// ---------- OTA HTTP usando HTTPUpdate ----------
+// ---------- OTA HTTP (FAST manual streaming) ----------
 void doHttpUpdate(const String& url, const String& fname) {
   otaRunning = true;
 
   publishStatus("OTA HTTP START: " + fname);
   publishStatus("OTA HTTP URL: " + url);
 
-  WiFiClientSecure updateClient;
-  updateClient.setInsecure();  // HTTPS sin validar CA (útil para Render)
+  // LED indicador
+  pinMode(CMD_LED_PIN, OUTPUT);
+  digitalWrite(CMD_LED_PIN, HIGH);
 
-  httpUpdate.setLedPin(CMD_LED_PIN, HIGH);
+  bool isHttps = url.startsWith("https://");
 
-  httpUpdate.onStart([]() {
-    Serial.println("[HTTPUPDATE] start");
-  });
-  httpUpdate.onEnd([]() {
-    Serial.println("[HTTPUPDATE] end");
-  });
-  httpUpdate.onError([](int err) {
-    Serial.printf("[HTTPUPDATE] Error %d\n", err);
-  });
-  httpUpdate.onProgress([](int cur, int total) {
-    Serial.printf("[HTTPUPDATE] Progreso: %d / %d\n", cur, total);
-  });
+  WiFiClient* stream = nullptr;
 
-  publishStatus("OTA HTTP: llamando a httpUpdate.update(...)");
+  WiFiClientSecure httpsClient;
+  WiFiClient httpClient;
 
-  t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
+  HTTPClient http;
 
-  switch (ret) {
-    case HTTP_UPDATE_FAILED: {
-      int err = httpUpdate.getLastError();
-      String errStr = httpUpdate.getLastErrorString();
-      publishStatus("OTA ERROR: update failed err=" + String(err) + " (" + errStr + ")");
-      break;
+  if (isHttps) {
+    httpsClient.setInsecure(); // Render / HTTPS sin CA
+    if (!http.begin(httpsClient, url)) {
+      publishStatus("OTA ERROR: http.begin(https) failed");
+      digitalWrite(CMD_LED_PIN, LOW);
+      otaRunning = false;
+      return;
     }
-    case HTTP_UPDATE_NO_UPDATES:
-      publishStatus("OTA INFO: sin actualización (HTTP_UPDATE_NO_UPDATES)");
-      break;
-
-    case HTTP_UPDATE_OK:
-      publishStatus("OTA OK ✅ (HTTP_UPDATE_OK). Reiniciando...");
-      delay(1000);
-      ESP.restart();
-      break;
+  } else {
+    if (!http.begin(httpClient, url)) {
+      publishStatus("OTA ERROR: http.begin(http) failed");
+      digitalWrite(CMD_LED_PIN, LOW);
+      otaRunning = false;
+      return;
+    }
   }
 
-  otaRunning = false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    publishStatus("OTA ERROR: HTTP " + String(code));
+    http.end();
+    digitalWrite(CMD_LED_PIN, LOW);
+    otaRunning = false;
+    return;
+  }
+
+  int total = http.getSize();
+  stream = http.getStreamPtr();
+  if (!stream) {
+    publishStatus("OTA ERROR: stream null");
+    http.end();
+    digitalWrite(CMD_LED_PIN, LOW);
+    otaRunning = false;
+    return;
+  }
+
+  if (!Update.begin(total > 0 ? total : UPDATE_SIZE_UNKNOWN)) {
+    publishStatus("OTA ERROR: Update.begin failed err=" + String(Update.getError()));
+    http.end();
+    digitalWrite(CMD_LED_PIN, LOW);
+    otaRunning = false;
+    return;
+  }
+
+  publishStatus("OTA HTTP: descargando y escribiendo...");
+
+  // Buffer grande: 16KB (puedes probar 32768 si tu RAM lo permite cómodo)
+  static uint8_t buf[16384];
+
+  unsigned long lastProg = 0;
+  int writtenTotal = 0;
+
+  while (http.connected()) {
+    size_t avail = stream->available();
+    if (!avail) {
+      delay(1);
+      continue;
+    }
+
+    int toRead = (avail > sizeof(buf)) ? sizeof(buf) : (int)avail;
+    int n = stream->readBytes(buf, toRead);
+    if (n <= 0) break;
+
+    size_t w = Update.write(buf, n);
+    writtenTotal += (int)w;
+
+    // Progreso cada ~500ms para no spamear
+    if (millis() - lastProg > 500) {
+      lastProg = millis();
+      if (total > 0) {
+        Serial.printf("[OTA] %d / %d\n", writtenTotal, total);
+      } else {
+        Serial.printf("[OTA] %d\n", writtenTotal);
+      }
+    }
+  }
+
+  if (!Update.end(true)) {
+    publishStatus("OTA ERROR: Update.end failed err=" + String(Update.getError()));
+    http.end();
+    digitalWrite(CMD_LED_PIN, LOW);
+    otaRunning = false;
+    return;
+  }
+
+  http.end();
+
+  publishStatus("OTA OK ✅ Reiniciando...");
+  delay(500);
+  ESP.restart();
 }
 
 // ---------- Parse mensaje OTA HTTP ----------
@@ -128,86 +191,3 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (t == T("comandos")) {
     publishLog("CMD RX: " + msg);
-    if (msg == "LED_ON")  digitalWrite(CMD_LED_PIN, HIGH);
-    if (msg == "LED_OFF") digitalWrite(CMD_LED_PIN, LOW);
-    return;
-  }
-
-  if (t == T("ota/http")) {
-    if (otaRunning) {
-      publishStatus("OTA ya en curso, ignoro nuevo mensaje.");
-      return;
-    }
-
-    String url, fname;
-    if (!parseHttpOtaMsg(msg, url, fname)) {
-      publishStatus("OTA ERROR: mensaje HTTP inválido");
-      return;
-    }
-
-    doHttpUpdate(url, fname);
-    return;
-  }
-}
-
-// ---------- WiFi / MQTT ----------
-void setup_wifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando WiFi");
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi conectado ✅");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
-  publishStatus("WIFI OK IP=" + WiFi.localIP().toString(), true);
-}
-
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Conectando MQTT... ");
-    String clientId = "ESP32_HTTPUPDATE_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-
-    bool ok = client.connect(
-      clientId.c_str(),
-      T("status").c_str(), 0, true, "OFFLINE ❌"
-    );
-
-    if (ok) {
-      Serial.println("OK ✅");
-      client.subscribe(T("comandos").c_str());
-      client.subscribe(T("ota/http").c_str());
-      publishStatus("ONLINE HTTPUPDATE ✅ BaseTopic=" + String(BaseTopic), true);
-    } else {
-      Serial.print("Fallo rc="); Serial.print(client.state());
-      Serial.println(" reintento 3s...");
-      delay(3000);
-    }
-  }
-}
-
-// ---------- Implementaciones CoreSetup/CoreLoop ----------
-void CoreSetup() {
-  Serial.begin(115200);
-  delay(200);
-
-  pinMode(CMD_LED_PIN, OUTPUT);
-  digitalWrite(CMD_LED_PIN, LOW);
-
-  setup_wifi();
-
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-  client.setBufferSize(MQTT_MAX_PACKET_SIZE);
-
-  Serial.println("ESP32 CORE_OTA listo...");
-}
-
-void CoreLoop() {
-  if (!client.connected() && !otaRunning) reconnect();
-  if (!otaRunning) client.loop();
-
-  static unsigned long lastHb = 0;
-  if (!otaRunning && millis() - lastHb > 5000) {
-    lastHb = millis();
-    publishStatus("HB milis=" + String(millis()), true);
-  }
-}
