@@ -27,53 +27,42 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Cache 1: toolchain + core + índices
-      - name: Cache Arduino toolchain/core
+      # Cache: SOLO lo pesado y estable (toolchain/core), sin duplicar keys
+      - name: Cache ESP32 toolchain + core (lean)
         uses: actions/cache@v4
         with:
           path: |
-            ~/.arduino15
+            ~/.arduino15/packages
+            ~/.arduino15/staging
             ~/.cache/arduino
-          key: ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-toolchain-v1
-          restore-keys: |
-            ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-toolchain-
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-arduino-cli-${{ env.ARDUINO_CLI_VERSION }}
 
-      # Cache 2: build intermedio (esto suele ser lo que más se nota)
+      # Cache: build intermedio (pequeño)
       - name: Cache Arduino build artifacts
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.BUILD_PATH }}
             ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-esp32core${{ env.ESP32_CORE_VERSION }}-build-v1
-          restore-keys: |
-            ${{ runner.os }}-esp32core${{ env.ESP32_CORE_VERSION }}-build-
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
           version: 0.35.3
 
-      - name: Setup ESP32 core (skip if cached)
+      - name: Setup ESP32 core (skip if already installed)
         shell: bash
         run: |
           set -e
           arduino-cli config init || true
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-          # Si el index ya existe, no lo actualizamos (ahorra tiempo de red)
-          if [ -f ~/.arduino15/package_esp32_index.json ] || [ -f ~/.arduino15/package_index.json ]; then
-            echo "Index ya existe ✅ (skip update-index)"
-          else
-            echo "Index no existe -> core update-index..."
-            arduino-cli core update-index
-          fi
-
-          # Solo instalar si NO está la versión exacta
+          # Si ya está el core exacto, NO actualizamos índices ni reinstalamos
           if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
-            echo "ESP32 core ${ESP32_CORE_VERSION} ya instalado ✅"
+            echo "ESP32 core ${ESP32_CORE_VERSION} ya instalado ✅ (cache hit)"
           else
-            echo "Instalando ESP32 core ${ESP32_CORE_VERSION}..."
+            echo "Core no encontrado -> update-index + install..."
             arduino-cli core update-index
             arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
           fi
@@ -120,7 +109,7 @@ jobs:
 
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-      - name: Compilar sketch (build-path + caches)
+      - name: Compilar sketch (build-path + build-cache)
         shell: bash
         run: |
           mkdir -p "${BUILD_PATH}" "${BUILD_CACHE_DIR}"
