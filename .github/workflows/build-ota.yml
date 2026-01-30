@@ -33,13 +33,14 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      - name: Descargar librería PubSubClient (local en ./lib)
+      - name: Descargar PubSubClient y copiarlo a sketch
         run: |
           mkdir -p lib
-          cd lib
-          git clone https://github.com/knolleary/pubsubclient.git PubSubClient
-          echo "Contenido de ./lib:"
-          ls -R ..
+          git clone https://github.com/knolleary/pubsubclient.git lib/PubSubClient
+          mkdir -p sketch
+          cp lib/PubSubClient/src/PubSubClient.* sketch/
+          echo "Contenido de sketch tras copiar PubSubClient:"
+          ls -R sketch
 
       - name: Inyectar WiFi y user_app.cpp
         env:
@@ -57,16 +58,15 @@ jobs:
           # Crear user_app.cpp desde base64
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
 
-          echo "Archivos en sketch/:"
+          echo "Archivos en sketch después de inyectar user_app:"
           ls -R sketch
 
       - name: Compilar sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32da --libraries ./lib sketch
+          arduino-cli compile --fqbn esp32:esp32:esp32da sketch
 
       - name: Preparar firmware como archivo de salida
         run: |
-          # Buscar el .bin generado por arduino-cli
           BIN_PATH=$(find . -path "*sketch.ino.bin" -o -path "*sketch.bin" | head -n 1)
           echo "BIN_PATH=$BIN_PATH"
           if [ -z "$BIN_PATH" ]; then
