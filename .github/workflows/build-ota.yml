@@ -34,6 +34,11 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
+      # (Opcional pero útil) Ver boards disponibles si algún día cambias el FQBN
+      - name: Listar boards ESP32 disponibles (debug)
+        run: |
+          arduino-cli board listall esp32:esp32 | head -n 80
+
       - name: Descargar PubSubClient y copiarlo a sketch
         run: |
           mkdir -p lib
@@ -64,18 +69,36 @@ jobs:
 
       - name: Compilar sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32da sketch
+          # IMPORTANTE:
+          # Si tu FQBN cambia, ajústalo aquí.
+          # Por ahora dejamos tu mismo FQBN para no romperte nada.
+          arduino-cli compile --fqbn esp32:esp32:esp32da sketch --output-dir build
+          echo "Contenido de build/"
+          ls -la build
 
       - name: Preparar firmware como archivo de salida
         run: |
-          BIN_PATH=$(find . -path "*sketch.ino.bin" -o -path "*sketch.bin" | head -n 1)
+          # Preferimos el bin principal de la app (normalmente *sketch.ino.bin*)
+          BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
+
+          # Fallback: si no existe con ese nombre, agarramos el primer .bin que NO sea bootloader/partitions
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH=$(find build -maxdepth 1 -type f -name "*.bin" \
+              ! -name "*bootloader*" ! -name "*partitions*" | head -n 1)
+          fi
+
           echo "BIN_PATH=$BIN_PATH"
           if [ -z "$BIN_PATH" ]; then
-            echo "No se encontró firmware .bin"
+            echo "No se encontró firmware .bin en build/"
+            echo "Listado de build:"
+            ls -la build
             exit 1
           fi
+
           mkdir -p out
           cp "$BIN_PATH" out/firmware.bin
+          echo "Firmware final:"
+          ls -la out/firmware.bin
 
       - name: Subir firmware como artifact
         uses: actions/upload-artifact@v4
