@@ -191,3 +191,86 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (t == T("comandos")) {
     publishLog("CMD RX: " + msg);
+    if (msg == "LED_ON")  digitalWrite(CMD_LED_PIN, HIGH);
+    if (msg == "LED_OFF") digitalWrite(CMD_LED_PIN, LOW);
+    return;
+  }
+
+  if (t == T("ota/http")) {
+    if (otaRunning) {
+      publishStatus("OTA ya en curso, ignoro nuevo mensaje.");
+      return;
+    }
+
+    String url, fname;
+    if (!parseHttpOtaMsg(msg, url, fname)) {
+      publishStatus("OTA ERROR: mensaje HTTP inválido");
+      return;
+    }
+
+    doHttpUpdate(url, fname);
+    return;
+  }
+}
+
+// ---------- WiFi / MQTT ----------
+void setup_wifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi conectado ✅");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+  publishStatus("WIFI OK IP=" + WiFi.localIP().toString(), true);
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Conectando MQTT... ");
+    String clientId = "ESP32_HTTPUPDATE_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    bool ok = client.connect(
+      clientId.c_str(),
+      T("status").c_str(), 0, true, "OFFLINE ❌"
+    );
+
+    if (ok) {
+      Serial.println("OK ✅");
+      client.subscribe(T("comandos").c_str());
+      client.subscribe(T("ota/http").c_str());
+      publishStatus("ONLINE HTTPUPDATE ✅ BaseTopic=" + String(BaseTopic), true);
+    } else {
+      Serial.print("Fallo rc="); Serial.print(client.state());
+      Serial.println(" reintento 3s...");
+      delay(3000);
+    }
+  }
+}
+
+// ---------- Implementaciones CoreSetup/CoreLoop ----------
+void CoreSetup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(CMD_LED_PIN, OUTPUT);
+  digitalWrite(CMD_LED_PIN, LOW);
+
+  setup_wifi();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+  client.setBufferSize(MQTT_MAX_PACKET_SIZE);
+
+  Serial.println("ESP32 CORE_OTA listo...");
+}
+
+void CoreLoop() {
+  if (!client.connected() && !otaRunning) reconnect();
+  if (!otaRunning) client.loop();
+
+  static unsigned long lastHb = 0;
+  if (!otaRunning && millis() - lastHb > 5000) {
+    lastHb = millis();
+    publishStatus("HB milis=" + String(millis()), true);
+  }
+}
