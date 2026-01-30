@@ -34,7 +34,6 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      # (Opcional pero útil) Ver boards disponibles si algún día cambias el FQBN
       - name: Listar boards ESP32 disponibles (debug)
         run: |
           arduino-cli board listall esp32:esp32 | head -n 80
@@ -67,11 +66,39 @@ jobs:
           echo "Archivos en sketch después de inyectar user_app:"
           ls -R sketch
 
+      - name: Normalizar user_app.cpp (evitar setup/loop duplicados)
+        run: |
+          echo "Normalizando user_app.cpp..."
+
+          # Si el usuario mandó un sketch completo con setup/loop, lo convertimos a UserSetup/UserLoop
+          if grep -qE '^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "Detectado: void setup() -> renombrando a void UserSetup()"
+            sed -i -E 's/^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(/void UserSetup(/' sketch/user_app.cpp
+          fi
+
+          if grep -qE '^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "Detectado: void loop() -> renombrando a void UserLoop()"
+            sed -i -E 's/^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(/void UserLoop(/' sketch/user_app.cpp
+          fi
+
+          # Validación: deben existir UserSetup y UserLoop
+          if ! grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "ERROR: user_app.cpp no define UserSetup()."
+            echo "Asegúrate de mandar UserSetup/UserLoop o setup/loop (que se convertirá)."
+            exit 1
+          fi
+
+          if ! grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "ERROR: user_app.cpp no define UserLoop()."
+            echo "Asegúrate de mandar UserSetup/UserLoop o setup/loop (que se convertirá)."
+            exit 1
+          fi
+
+          echo "OK: user_app.cpp expone UserSetup/UserLoop."
+
       - name: Compilar sketch
         run: |
-          # IMPORTANTE:
-          # Si tu FQBN cambia, ajústalo aquí.
-          # Por ahora dejamos tu mismo FQBN para no romperte nada.
+          # Mantengo tu FQBN para no romperte nada (ya que lo reconoce).
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch --output-dir build
           echo "Contenido de build/"
           ls -la build
