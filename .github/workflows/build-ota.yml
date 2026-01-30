@@ -1,4 +1,4 @@
-﻿name: Build ESP32 OTA firmware
+name: Build ESP32 OTA firmware
 
 on:
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
             ~/.arduino15
             ~/.cache/arduino
             ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-v1
+          key: ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-v2
           restore-keys: |
             ${{ runner.os }}-arduino-cli${{ env.ARDUINO_CLI_VERSION }}-esp32core${{ env.ESP32_CORE_VERSION }}-
 
@@ -42,18 +42,35 @@ jobs:
         with:
           version: 0.35.3
 
-      - name: Setup ESP32 core (pinned)
+      - name: Setup ESP32 core (pinned, skip if cached)
+        shell: bash
         run: |
-          arduino-cli config init
+          set -e
+
+          # Init config (no falla si ya existe)
+          arduino-cli config init || true
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+          # Index (suele ser rápido)
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
+
+          echo "Core list actual:"
+          arduino-cli core list || true
+
+          # Solo instalar si NO está ya la versión exacta
+          if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
+            echo "ESP32 core ${ESP32_CORE_VERSION} ya instalado ✅ (cache)"
+          else
+            echo "Instalando ESP32 core ${ESP32_CORE_VERSION}..."
+            arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
+          fi
 
       - name: Inyectar WiFi y user_app.cpp
         env:
           WIFI_SSID: ${{ github.event.inputs.ssid }}
           WIFI_PASS: ${{ github.event.inputs.pass }}
           CODE_B64: ${{ github.event.inputs.code_b64 }}
+        shell: bash
         run: |
           mkdir -p sketch
           echo '#pragma once' > sketch/config_wifi.h
@@ -64,6 +81,7 @@ jobs:
           ls -R sketch
 
       - name: Normalizar user_app.cpp (evitar setup/loop duplicados)
+        shell: bash
         run: |
           echo "Normalizando user_app.cpp..."
 
@@ -90,13 +108,17 @@ jobs:
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
       - name: Compilar sketch (con build cache)
+        shell: bash
         run: |
           mkdir -p ${BUILD_CACHE_DIR}
-          arduino-cli compile --fqbn esp32:esp32:esp32da sketch --output-dir build --build-cache-path ${BUILD_CACHE_DIR}
+          arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
+            --output-dir build \
+            --build-cache-path ${BUILD_CACHE_DIR}
           echo "Contenido de build/"
           ls -la build
 
       - name: Preparar firmware como archivo de salida
+        shell: bash
         run: |
           BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
 
