@@ -1,0 +1,54 @@
+name: Build ESP32 OTA firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      code_b64:
+        description: "Contenido de user_app.cpp en Base64"
+        required: true
+      ssid:
+        description: "WiFi SSID"
+        required: true
+      pass:
+        description: "WiFi password"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Setup ESP32 core
+        run: |
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Inyectar WiFi y user_app.cpp
+        run: |
+          # Sobrescribir config_wifi.h con SSID/PASS recibidos
+          cat << EOF > sketch/config_wifi.h
+          #pragma once
+          #define WIFI_SSID "${{ github.event.inputs.ssid }}"
+          #define WIFI_PASS "${{ github.event.inputs.pass }}"
+          EOF
+
+          # Crear user_app.cpp desde base64
+          echo "${{ github.event.inputs.code_b64 }}" | base64 -d > sketch/user_app.cpp
+
+      - name: Compilar sketch
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32da sketch
+
+      - name: Subir firmware como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: sketch/build/esp32.esp32.esp32da/sketch.ino.bin
