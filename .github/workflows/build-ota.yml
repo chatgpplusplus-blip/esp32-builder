@@ -23,28 +23,43 @@ jobs:
       BUILD_PATH: ".arduino-build"
       BUILD_CACHE_DIR: ".arduino-build-cache"
 
+      # cache key versioning (para que puedas “reiniciar” cache cambiando el sufijo)
+      CACHE_TAG: "lean-v1"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Cache: SOLO lo pesado y estable (toolchain/core), sin duplicar keys
+      # Cache 1: Toolchain + core ESP32 (LEAN, enfocado en esp32 “xtensa”)
       - name: Cache ESP32 toolchain + core (lean)
+        id: cache_toolchain
         uses: actions/cache@v4
         with:
           path: |
-            ~/.arduino15/packages
+            ~/.arduino15/packages/esp32/hardware/esp32/${{ env.ESP32_CORE_VERSION }}
+            ~/.arduino15/packages/esp32/tools/esp-x32
+            ~/.arduino15/packages/esp32/tools/esptool_py
+            ~/.arduino15/packages/esp32/tools/mkspiffs
+            ~/.arduino15/packages/esp32/tools/mklittlefs
             ~/.arduino15/staging
             ~/.cache/arduino
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-arduino-cli-${{ env.ARDUINO_CLI_VERSION }}
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-arduino-cli-${{ env.ARDUINO_CLI_VERSION }}-${{ env.CACHE_TAG }}
 
-      # Cache: build intermedio (pequeño)
+      # Cache 2: build caches (pequeño)
       - name: Cache Arduino build artifacts
+        id: cache_build
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.BUILD_PATH }}
             ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache-${{ env.CACHE_TAG }}
+
+      - name: Cache status
+        shell: bash
+        run: |
+          echo "toolchain cache-hit = ${{ steps.cache_toolchain.outputs.cache-hit }}"
+          echo "build cache-hit     = ${{ steps.cache_build.outputs.cache-hit }}"
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
@@ -58,7 +73,6 @@ jobs:
           arduino-cli config init || true
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-          # Si ya está el core exacto, NO actualizamos índices ni reinstalamos
           if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
             echo "ESP32 core ${ESP32_CORE_VERSION} ya instalado ✅ (cache hit)"
           else
@@ -75,10 +89,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p sketch
+
           echo '#pragma once' > sketch/config_wifi.h
           echo '#define WIFI_SSID "'$WIFI_SSID'"' >> sketch/config_wifi.h
           echo '#define WIFI_PASS "'$WIFI_PASS'"' >> sketch/config_wifi.h
+
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
+
           echo "Archivos en sketch después de inyectar user_app:"
           ls -R sketch
 
@@ -109,20 +126,29 @@ jobs:
 
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-      - name: Compilar sketch (build-path + build-cache)
+      - name: Compilar sketch (build-path + build-cache + parallel jobs)
         shell: bash
         run: |
+          set -e
           mkdir -p "${BUILD_PATH}" "${BUILD_CACHE_DIR}"
+
+          JOBS="$(nproc)"
+          echo "Using jobs=$JOBS"
+
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
             --output-dir build \
             --build-path "${BUILD_PATH}" \
-            --build-cache-path "${BUILD_CACHE_DIR}"
+            --build-cache-path "${BUILD_CACHE_DIR}" \
+            --jobs "${JOBS}"
+
           echo "Contenido de build/"
           ls -la build
 
       - name: Preparar firmware como archivo de salida
         shell: bash
         run: |
+          set -e
+
           BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
 
           if [ -z "$BIN_PATH" ]; then
