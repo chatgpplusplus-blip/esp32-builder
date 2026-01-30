@@ -22,15 +22,13 @@ jobs:
       ESP32_CORE_VERSION: "3.3.6"
       BUILD_PATH: ".arduino-build"
       BUILD_CACHE_DIR: ".arduino-build-cache"
-
-      # cache key versioning (para que puedas “reiniciar” cache cambiando el sufijo)
       CACHE_TAG: "lean-v1"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Cache 1: Toolchain + core ESP32 (LEAN, enfocado en esp32 “xtensa”)
+      # Cache 1: toolchain + core (lean, solo lo necesario)
       - name: Cache ESP32 toolchain + core (lean)
         id: cache_toolchain
         uses: actions/cache@v4
@@ -45,7 +43,7 @@ jobs:
             ~/.cache/arduino
           key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-arduino-cli-${{ env.ARDUINO_CLI_VERSION }}-${{ env.CACHE_TAG }}
 
-      # Cache 2: build caches (pequeño)
+      # Cache 2: build intermedio
       - name: Cache Arduino build artifacts
         id: cache_build
         uses: actions/cache@v4
@@ -126,20 +124,16 @@ jobs:
 
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-      - name: Compilar sketch (build-path + build-cache + parallel jobs)
+      - name: Compilar sketch (build-path + build-cache)
         shell: bash
         run: |
           set -e
           mkdir -p "${BUILD_PATH}" "${BUILD_CACHE_DIR}"
 
-          JOBS="$(nproc)"
-          echo "Using jobs=$JOBS"
-
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
             --output-dir build \
             --build-path "${BUILD_PATH}" \
-            --build-cache-path "${BUILD_CACHE_DIR}" \
-            --jobs "${JOBS}"
+            --build-cache-path "${BUILD_CACHE_DIR}"
 
           echo "Contenido de build/"
           ls -la build
@@ -148,7 +142,6 @@ jobs:
         shell: bash
         run: |
           set -e
-
           BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
 
           if [ -z "$BIN_PATH" ]; then
