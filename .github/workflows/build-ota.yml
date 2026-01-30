@@ -33,26 +33,13 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
-      - name: Install required Arduino libraries (PubSubClient)
+      - name: Descargar librería PubSubClient (local en ./lib)
         run: |
-          set -e
-
-          echo "Actualizando índice de librerías..."
-          arduino-cli lib update-index || true
-
-          echo "Intentando instalar PubSubClient desde el Library Manager..."
-          if ! arduino-cli lib install "PubSubClient"; then
-            echo "Fallo al instalar PubSubClient desde el Library Manager. Lo descargo manualmente..."
-            mkdir -p "$HOME/Arduino/libraries"
-            cd "$HOME/Arduino/libraries"
-            wget -q https://github.com/knolleary/pubsubclient/archive/refs/heads/master.zip -O PubSubClient.zip
-            unzip -q PubSubClient.zip
-            # carpeta suele llamarse pubsubclient-master o similar
-            mv pubsubclient-* PubSubClient
-          fi
-
-          echo "=== Lista de librerías instaladas ==="
-          arduino-cli lib list || true
+          mkdir -p lib
+          cd lib
+          git clone https://github.com/knolleary/pubsubclient.git PubSubClient
+          echo "Contenido de ./lib:"
+          ls -R ..
 
       - name: Inyectar WiFi y user_app.cpp
         env:
@@ -70,9 +57,12 @@ jobs:
           # Crear user_app.cpp desde base64
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
 
+          echo "Archivos en sketch/:"
+          ls -R sketch
+
       - name: Compilar sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32da sketch
+          arduino-cli compile --fqbn esp32:esp32:esp32da --libraries ./lib sketch
 
       - name: Preparar firmware como archivo de salida
         run: |
