@@ -20,41 +20,55 @@ jobs:
     env:
       ARDUINO_CLI_VERSION: "1.4.1"
       ESP32_CORE_VERSION: "3.3.6"
-      BUILD_CACHE_DIR: ".arduino-build-cache"
 
     steps:
-      - name: Checkout repo
+      # 1) Checkout mínimo (sparse) para que no tarde 15–20s en traer todo el repo
+      - name: Checkout repo (solo lo necesario)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          # Ajusta esta lista según cómo esté estructurado tu repo
+          sparse-checkout: |
+            sketch
+            core_ota.*
+            PubSubClient.*
+            user_app.*
+            config_wifi.h
+            .github/workflows
+          sparse-checkout-cone-mode: true
 
-      # Cache ESP32 packages
+      # 2) Cache del core ESP32 (toolchains, etc.)
       - name: Cache ESP32 packages
         id: cache_packages
         uses: actions/cache@v4
         with:
           path: |
             ~/.arduino15/packages
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-fast-v2
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-fast-v3
 
-      # Cache build-cache (core.a, etc.)
-      - name: Cache build-cache
+      # 3) Cache del build cache global de Arduino (cores + sketches)
+      #    Aquí es donde se va a notar la diferencia a partir del segundo build
+      - name: Cache Arduino build cache
         id: cache_build
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache-cli-${{ env.ARDUINO_CLI_VERSION }}-fast-v2
+          path: ~/.cache/arduino
+          key: ${{ runner.os }}-arduino-build-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-v1
 
+      # 4) Instalar Arduino CLI
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
           version: ${{ env.ARDUINO_CLI_VERSION }}
 
+      # 5) Instalar / reparar core ESP32 (si no está ya en cache_packages)
       - name: Setup ESP32 core (repair if needed)
         shell: bash
         run: |
           set -e
           arduino-cli config init || true
-          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli config set board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
           if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
             echo "ESP32 core ${ESP32_CORE_VERSION} OK ✅"
@@ -64,11 +78,13 @@ jobs:
             arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
           fi
 
+          # Fix por si falta esp32-libs (bootloader_qio_80m.elf, etc.)
           if ! find "$HOME/.arduino15/packages/esp32" -path "*esp32-libs*" -name "bootloader_qio_80m.elf" -print -quit | grep -q .; then
             echo "esp32-libs missing -> reinstall core tools"
             arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION} --overwrite
           fi
 
+      # 6) Inyectar WiFi y user_app.cpp
       - name: Inyectar WiFi y user_app.cpp
         shell: bash
         env:
@@ -85,6 +101,7 @@ jobs:
           EOF
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
 
+      # 7) Normalizar (por si el user mandó setup/loop en vez de UserSetup/UserLoop)
       - name: Normalizar user_app.cpp (setup/loop -> UserSetup/UserLoop)
         shell: bash
         run: |
@@ -98,23 +115,23 @@ jobs:
           grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp
           grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp
 
-      - name: Compilar sketch (parallel)
+      # 8) Compilar usando:
+      #    - cache global (~/.cache/arduino)
+      #    - todos los cores (--jobs 0)
+      #    - SIN --build-path (para que el caché funcione)
+      - name: Compilar sketch (rápido, usando cache global)
         shell: bash
         run: |
           set -e
-          mkdir -p "${BUILD_CACHE_DIR}"
-          BUILD_PATH="${RUNNER_TEMP}/arduino-build"
-          mkdir -p "${BUILD_PATH}"
+          mkdir -p build
 
-          # --jobs 0 => usa todos los cores disponibles
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
             --output-dir build \
-            --build-path "${BUILD_PATH}" \
-            --build-cache-path "${BUILD_CACHE_DIR}" \
             --jobs 0
 
           ls -la build
 
+      # 9) Preparar firmware.bin
       - name: Preparar firmware
         shell: bash
         run: |
@@ -125,6 +142,7 @@ jobs:
           cp "$BIN_PATH" out/firmware.bin
           ls -la out/firmware.bin
 
+      # 10) Subir artifact (igual que antes)
       - name: Subir artifact
         uses: actions/upload-artifact@v4
         with:
