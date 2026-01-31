@@ -18,49 +18,40 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ARDUINO_CLI_VERSION: "0.35.3"
+      ARDUINO_CLI_VERSION: "1.2.0"
       ESP32_CORE_VERSION: "3.3.6"
       BUILD_PATH: ".arduino-build"
       BUILD_CACHE_DIR: ".arduino-build-cache"
+      # Puedes ajustar esto:
+      BUILD_JOBS: "4"   # o "0" para auto
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ✅ Cache 1: Arduino HOME completo (evita missing tools/esp32-libs)
-      - name: Cache Arduino home (~/.arduino15) + arduino cache
-        id: cache_arduino
+      # Cache: toolchain/core "pesado"
+      - name: Cache ESP32 toolchain + core (lean)
         uses: actions/cache@v4
         with:
           path: |
-            ~/.arduino15
+            ~/.arduino15/packages
+            ~/.arduino15/staging
             ~/.cache/arduino
-          key: ${{ runner.os }}-arduino15-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-v1
-          restore-keys: |
-            ${{ runner.os }}-arduino15-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-arduino-cli-${{ env.ARDUINO_CLI_VERSION }}-lean-v1
 
-      # ✅ Cache 2: build cache (pequeño)
-      - name: Cache build artifacts
-        id: cache_build
+      # Cache: build intermedio (pequeño)
+      - name: Cache Arduino build artifacts
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.BUILD_PATH }}
             ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-buildcache-esp32-${{ env.ESP32_CORE_VERSION }}-v1
-          restore-keys: |
-            ${{ runner.os }}-buildcache-esp32-${{ env.ESP32_CORE_VERSION }}-
-
-      - name: Cache status
-        shell: bash
-        run: |
-          echo "arduino15 cache-hit = ${{ steps.cache_arduino.outputs.cache-hit }}"
-          echo "build    cache-hit = ${{ steps.cache_build.outputs.cache-hit }}"
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache-lean-v1
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
-          version: 0.35.3
+          version: ${{ env.ARDUINO_CLI_VERSION }}
 
       - name: Setup ESP32 core (skip if already installed)
         shell: bash
@@ -119,14 +110,17 @@ jobs:
 
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-      - name: Compilar sketch (build-path + build-cache)
+      - name: Compilar sketch (build-path + build-cache + jobs)
         shell: bash
         run: |
+          set -e
           mkdir -p "${BUILD_PATH}" "${BUILD_CACHE_DIR}"
+          echo "Using jobs=${BUILD_JOBS}"
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
             --output-dir build \
             --build-path "${BUILD_PATH}" \
-            --build-cache-path "${BUILD_CACHE_DIR}"
+            --build-cache-path "${BUILD_CACHE_DIR}" \
+            -j "${BUILD_JOBS}"
           echo "Contenido de build/"
           ls -la build
 
