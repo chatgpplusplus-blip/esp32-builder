@@ -33,7 +33,6 @@ static void publishStatus(const String& msg, bool retain = true) {
   Serial.println("[STATUS] " + msg);
   if (mqtt.connected()) {
     mqtt.publish(topicStatus.c_str(), msg.c_str(), retain);
-    Serial.println("[MQTT] " + topicStatus + " -> " + msg);
   }
 }
 
@@ -41,7 +40,6 @@ static void publishLog(const String& msg) {
   Serial.println("[LOG] " + msg);
   if (mqtt.connected()) {
     mqtt.publish(topicLog.c_str(), msg.c_str(), false);
-    Serial.println("[MQTT] " + topicLog + " -> " + msg);
   }
 }
 
@@ -56,7 +54,7 @@ static bool connectWiFi(unsigned long timeoutMs = 20000UL) {
 
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(250);
     Serial.print(".");
     if (millis() - t0 > timeoutMs) {
       Serial.println("\nWiFi TIMEOUT ❌");
@@ -71,9 +69,9 @@ static bool connectWiFi(unsigned long timeoutMs = 20000UL) {
   return true;
 }
 
-// ================== OTA: parse de mensaje HTTP|url|size|sha|file ==================
+// ================== OTA: parse HTTP|url|size|sha|file ==================
 
-static bool parseHttpOtaMsg(const String& msg, String& url, size_t& sz, String& fname) {
+static bool parseHttpOtaMsg(const String& msg, String& url, size_t& sz, String& shaHex, String& fname) {
   if (!msg.startsWith("HTTP|")) return false;
 
   int p1 = msg.indexOf('|');
@@ -82,13 +80,12 @@ static bool parseHttpOtaMsg(const String& msg, String& url, size_t& sz, String& 
   int p4 = msg.indexOf('|', p3 + 1);
   if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
 
-  url = msg.substring(p1 + 1, p2);
+  url    = msg.substring(p1 + 1, p2);
   String sizeStr = msg.substring(p2 + 1, p3);
-  // sha = msg.substring(p3 + 1, p4); // ahora mismo no lo usamos
-  fname = msg.substring(p4 + 1);
+  shaHex = msg.substring(p3 + 1, p4);
+  fname  = msg.substring(p4 + 1);
 
-  url.trim();
-  fname.trim();
+  url.trim(); shaHex.trim(); fname.trim();
 
   long s = sizeStr.toInt();
   if (s <= 0) return false;
@@ -99,7 +96,7 @@ static bool parseHttpOtaMsg(const String& msg, String& url, size_t& sz, String& 
   return true;
 }
 
-// ================== OTA HTTP manual (HTTPClient + Update) ==================
+// ================== OTA HTTP (OPTIMIZADO) ==================
 
 static bool otaHttpUpdate(const String& url, size_t expectedSize, const String& fname) {
   otaRunning = true;
@@ -108,12 +105,12 @@ static bool otaHttpUpdate(const String& url, size_t expectedSize, const String& 
   publishStatus("OTA HTTP URL: " + url);
 
   WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout((uint32_t)OTA_READ_TIMEOUT_MS);
+  client.setInsecure();              // (seguridad aparte; esto es velocidad/compat)
+  client.setTimeout(15);             // segundos (ESP32 core suele interpretar en s)
 
   HTTPClient http;
-  http.setTimeout((int)OTA_READ_TIMEOUT_MS);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout((int)OTA_READ_TIMEOUT_MS);
 
   if (!http.begin(client, url)) {
     publishStatus("OTA FAIL: http.begin()");
@@ -129,72 +126,65 @@ static bool otaHttpUpdate(const String& url, size_t expectedSize, const String& 
     return false;
   }
 
-  int contentLen = http.getSize();  // -1 si chunked
-  if (contentLen > 0) {
-    publishStatus("OTA HTTP: size=" + String(contentLen));
-  } else {
-    publishStatus("OTA HTTP: size desconocido (chunked)");
-  }
+  int contentLen = http.getSize(); // -1 si chunked
+  if (contentLen > 0) publishStatus("OTA HTTP: contentLen=" + String(contentLen));
+  else publishStatus("OTA HTTP: chunked/unknown size");
 
-  // Si el servidor te promete un tamaño, podemos comparar luego
   size_t beginSize = (contentLen > 0) ? (size_t)contentLen : UPDATE_SIZE_UNKNOWN;
-
-  if (!Update.begin(beginSize)) {
+  if (!Update.begin(beginSize, U_FLASH)) {
     publishStatus("OTA FAIL: Update.begin err=" + String(Update.getError()));
     http.end();
     otaRunning = false;
     return false;
   }
 
-  publishStatus("OTA HTTP: descargando y escribiendo...");
+  publishStatus("OTA: descargando (bloques grandes) ...");
 
   WiFiClient* stream = http.getStreamPtr();
   static uint8_t buf[OTA_BUF_SIZE];
 
   size_t written = 0;
-  unsigned long lastProgress = 0;
   unsigned long lastByteAt = millis();
+  unsigned long lastReport = millis();
 
   while (true) {
-    if (contentLen > 0 && written >= (size_t)contentLen) {
-      break;
+    int r = stream->read(buf, sizeof(buf));  // lectura directa en bloque grande
+
+    if (r > 0) {
+      lastByteAt = millis();
+
+      size_t w = Update.write(buf, (size_t)r);
+      if (w != (size_t)r) {
+        publishStatus("OTA FAIL: Update.write err=" + String(Update.getError()));
+        Update.abort();
+        http.end();
+        otaRunning = false;
+        return false;
+      }
+
+      written += w;
+
+      // Reporte menos frecuente (Serial lento)
+      if (millis() - lastReport >= 2000) {
+        lastReport = millis();
+        if (contentLen > 0) {
+          Serial.printf("[OTA] %u/%u bytes\n", (unsigned)written, (unsigned)contentLen);
+        } else {
+          Serial.printf("[OTA] %u bytes\n", (unsigned)written);
+        }
+      }
+
+      // Si sabemos el contentLen, podemos cortar exacto
+      if (contentLen > 0 && written >= (size_t)contentLen) break;
     }
-
-    int avail = stream->available();
-    if (avail > 0) {
-      int toRead = avail;
-      if (toRead > (int)sizeof(buf)) {
-        toRead = (int)sizeof(buf);
-      }
-
-      int r = stream->readBytes(buf, toRead);
-      if (r > 0) {
-        lastByteAt = millis();
-
-        size_t w = Update.write(buf, (size_t)r);
-        if (w != (size_t)r) {
-          publishStatus("OTA FAIL: write err=" + String(Update.getError()));
-          Update.abort();
-          http.end();
-          otaRunning = false;
-          return false;
-        }
-
-        written += w;
-
-        if (millis() - lastProgress >= 500) {
-          lastProgress = millis();
-          if (contentLen > 0) {
-            Serial.printf("[OTA] %u / %u\n",
-                          (unsigned)written, (unsigned)contentLen);
-          } else {
-            Serial.printf("[OTA] %u bytes\n", (unsigned)written);
-          }
-        }
-      }
-    } else {
-      if (contentLen <= 0 && !http.connected()) {
-        break;
+    else {
+      // r <= 0: sin bytes ahora mismo
+      if (contentLen <= 0) {
+        // Si chunked/unknown: fin cuando desconecta
+        if (!http.connected()) break;
+      } else {
+        // Con length conocido, fin si ya llegamos
+        if (written >= (size_t)contentLen) break;
       }
 
       if (millis() - lastByteAt > OTA_STALL_TIMEOUT_MS) {
@@ -212,34 +202,23 @@ static bool otaHttpUpdate(const String& url, size_t expectedSize, const String& 
 
   http.end();
 
-  // Comprobación con content-length y con expectedSize (del mensaje)
+  // Chequeos de tamaño
   if (contentLen > 0 && written != (size_t)contentLen) {
-    publishStatus("OTA FAIL: size mismatch " +
-                  String((unsigned)written) + "/" +
-                  String(contentLen));
+    publishStatus("OTA FAIL: size mismatch " + String((unsigned)written) + "/" + String(contentLen));
     Update.abort();
     otaRunning = false;
     return false;
   }
 
   if (expectedSize > 0 && written != expectedSize) {
-    publishStatus("OTA WARN: esperado=" +
-                  String((unsigned)expectedSize) + " escrito=" +
-                  String((unsigned)written));
-    // No abortamos; sólo avisamos
+    publishStatus("OTA WARN: esperado=" + String((unsigned)expectedSize) + " escrito=" + String((unsigned)written));
+    // no abortamos
   }
 
   if (!Update.end(true)) {
     publishStatus("OTA FAIL: Update.end err=" + String(Update.getError()));
     otaRunning = false;
     return false;
-  }
-
-  if (contentLen > 0) {
-    Serial.printf("[OTA] %u / %u\n",
-                  (unsigned)written, (unsigned)contentLen);
-  } else {
-    Serial.printf("[OTA] done bytes=%u\n", (unsigned)written);
   }
 
   publishStatus("OTA OK ✅ reiniciando...");
@@ -249,8 +228,8 @@ static bool otaHttpUpdate(const String& url, size_t expectedSize, const String& 
   Serial.flush();
   delay(200);
 
-  ESP.restart();        // no deberías volver de aquí
-  return true;          // por si acaso
+  ESP.restart();
+  return true;
 }
 
 // ================== MQTT ==================
@@ -266,13 +245,14 @@ static void ensureMqtt() {
 
   while (!mqtt.connected() && !otaRunning) {
     Serial.print("Conectando MQTT... ");
-    String clientId = String("ESP32_HTTPUPDATE_") +
-                      String((uint32_t)ESP.getEfuseMac(), HEX);
+    String clientId = String("ESP32_HTTPUPDATE_") + String((uint32_t)ESP.getEfuseMac(), HEX);
 
     bool ok;
     if (String(MQTT_USER).length() > 0) {
+      // ✅ ahora sí usa usuario/clave si existen
       ok = mqtt.connect(
         clientId.c_str(),
+        MQTT_USER, MQTT_PASS,
         topicStatus.c_str(), 0, true,
         "OFFLINE ❌"
       );
@@ -288,17 +268,12 @@ static void ensureMqtt() {
       Serial.println("OK ✅");
       mqtt.subscribe(topicCmd.c_str());
       mqtt.subscribe(topicOtaHttp.c_str());
-
-      Serial.println("[MQTT] Subscribed to:");
-      Serial.println("  " + topicCmd);
-      Serial.println("  " + topicOtaHttp);
-
       publishStatus("ONLINE HTTPUPDATE ✅ BaseTopic=" + baseTopic, true);
     } else {
       Serial.print("Fallo rc=");
       Serial.print(mqtt.state());
-      Serial.println(" reintento 3s...");
-      delay(3000);
+      Serial.println(" reintento 2s...");
+      delay(2000);
     }
   }
 }
@@ -309,15 +284,10 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t(topic);
   String msg;
   msg.reserve(length + 4);
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
   msg.trim();
 
-  Serial.println("[MQTT CB] topic=" + t);
-  Serial.println("[MQTT CB] payload=" + msg);
-
-  // Comandos simples (LED_ON / LED_OFF)
+  // Comandos simples
   if (t == topicCmd) {
     publishLog("CMD RX: " + msg);
 
@@ -328,24 +298,24 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
       pinMode(CORE_LED_PIN, OUTPUT);
       digitalWrite(CORE_LED_PIN, LOW);
     }
-
     return;
   }
 
-  // OTA HTTP: topic EXACTO: baseTopic + "/ota/http"
+  // OTA HTTP
   if (t == topicOtaHttp) {
     if (otaRunning) {
       publishStatus("OTA ya en curso, ignoro nuevo mensaje.");
       return;
     }
 
-    String url, fname;
+    String url, sha, fname;
     size_t sz = 0;
-    if (!parseHttpOtaMsg(msg, url, sz, fname)) {
+    if (!parseHttpOtaMsg(msg, url, sz, sha, fname)) {
       publishStatus("OTA ERROR: mensaje HTTP inválido");
       return;
     }
 
+    // (sha se parsea, pero aquí lo dejamos para velocidad; validación hash sería robustez)
     otaHttpUpdate(url, sz, fname);
     return;
   }
@@ -355,7 +325,7 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 void CoreOtaSetup() {
   Serial.begin(115200);
-  delay(200);
+  delay(150);
 
   pinMode(CORE_LED_PIN, OUTPUT);
   digitalWrite(CORE_LED_PIN, LOW);
@@ -364,15 +334,14 @@ void CoreOtaSetup() {
   topicStatus  = T("status");
   topicLog     = T("log");
   topicCmd     = T("comandos");
-  topicOtaHttp = baseTopic + "/ota/http";   // IMPORTANTE: igual que tu código base
+  topicOtaHttp = baseTopic + "/ota/http";
 
   Serial.println("=== CORE_OTA INIT ===");
   Serial.println("BaseTopic: " + baseTopic);
-  Serial.println("StatusTopic: " + topicStatus);
 
   if (!connectWiFi()) {
     publishStatus("WIFI FAIL -> restart");
-    delay(500);
+    delay(300);
     ESP.restart();
   }
 
@@ -381,23 +350,17 @@ void CoreOtaSetup() {
 }
 
 void CoreOtaLoop() {
-  // Si hay OTA en curso, no hacemos nada más
-  if (otaRunning) {
-    return;
-  }
+  if (otaRunning) return;
 
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
 
   ensureMqtt();
-  if (mqtt.connected()) {
-    mqtt.loop();
-  }
+  if (mqtt.connected()) mqtt.loop();
 
-  // Heartbeat
   if (millis() - lastHb >= HEARTBEAT_MS) {
     lastHb = millis();
-    publishStatus("HB milis=" + String(millis()), true);
+    publishStatus("HB millis=" + String(millis()), true);
   }
 }
