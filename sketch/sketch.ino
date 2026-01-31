@@ -2,11 +2,11 @@
 #include "user_app.h"
 
 void setup() {
-  CoreSetup();   // WiFi + MQTT + OTA
+  CoreOtaSetup();   // WiFi + MQTT + OTA
   UserSetup();   // Lógica de aplicación
 }
 
 void loop() {
-  CoreLoop();    // Heartbeat, MQTT, OTA
+  CoreOtaLoop();    // Heartbeat, MQTT, OTA
   UserLoop();    // Tu lógica (setup/loop de aplicación)
 }
