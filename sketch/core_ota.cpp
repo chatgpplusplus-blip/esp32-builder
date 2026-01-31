@@ -1,276 +1,159 @@
-#include "core_ota.h"
-#include "config_wifi.h"
-#include "user_app.h"
+name: Build ESP32 OTA firmware
 
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <Update.h>
+on:
+  workflow_dispatch:
+    inputs:
+      code_b64:
+        description: "Contenido de user_app.cpp en Base64"
+        required: true
+      ssid:
+        description: "WiFi SSID"
+        required: true
+      pass:
+        description: "WiFi password"
+        required: true
 
-#define MQTT_MAX_PACKET_SIZE 2048
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-// WiFi desde config_wifi.h
-static const char* ssid     = WIFI_SSID;
-static const char* password = WIFI_PASS;
+    env:
+      ARDUINO_CLI_VERSION: "0.35.3"
+      ESP32_CORE_VERSION: "3.3.6"
+      BUILD_PATH: ".arduino-build"
+      BUILD_CACHE_DIR: ".arduino-build-cache"
 
-// MQTT
-static const char* mqtt_server = "broker.emqx.io";
-static const int   mqtt_port   = 1883;
-static const char* BaseTopic   = "bari/esp32/bari1";
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-String T(const char* tail) { return String(BaseTopic) + "/" + tail; }
+      # ✅ Cache 1: Arduino HOME completo (evita missing tools/esp32-libs)
+      - name: Cache Arduino home (~/.arduino15) + arduino cache
+        id: cache_arduino
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/.cache/arduino
+          key: ${{ runner.os }}-arduino15-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-v1
+          restore-keys: |
+            ${{ runner.os }}-arduino15-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-
 
-WiFiClient      mqttNet;
-PubSubClient    client(mqttNet);
+      # ✅ Cache 2: build cache (pequeño)
+      - name: Cache build artifacts
+        id: cache_build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.BUILD_PATH }}
+            ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ runner.os }}-buildcache-esp32-${{ env.ESP32_CORE_VERSION }}-v1
+          restore-keys: |
+            ${{ runner.os }}-buildcache-esp32-${{ env.ESP32_CORE_VERSION }}-
 
-const int CMD_LED_PIN = 2;   // LED para comandos / actividad
-static bool otaRunning = false;
+      - name: Cache status
+        shell: bash
+        run: |
+          echo "arduino15 cache-hit = ${{ steps.cache_arduino.outputs.cache-hit }}"
+          echo "build    cache-hit = ${{ steps.cache_build.outputs.cache-hit }}"
 
-// ---------- MQTT helpers ----------
-bool publishTopic(const String& topic, const String& msg, bool retain = false) {
-  if (!client.connected()) return false;
-  bool ok = client.publish(topic.c_str(), msg.c_str(), retain);
-  Serial.println("[MQTT] " + topic + " -> " + msg);
-  return ok;
-}
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: 0.35.3
 
-void publishStatus(const String& msg, bool retain = true) {
-  Serial.println("[STATUS] " + msg);
-  publishTopic(T("status"), msg, retain);
-}
+      - name: Setup ESP32 core (skip if already installed)
+        shell: bash
+        run: |
+          set -e
+          arduino-cli config init || true
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-void publishLog(const String& msg) {
-  Serial.println("[LOG] " + msg);
-  publishTopic(T("log"), msg, false);
-}
+          if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
+            echo "ESP32 core ${ESP32_CORE_VERSION} ya instalado ✅ (cache hit)"
+          else
+            echo "Core no encontrado -> update-index + install..."
+            arduino-cli core update-index
+            arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
+          fi
 
-// ---------- OTA HTTP (FAST manual streaming) ----------
-void doHttpUpdate(const String& url, const String& fname) {
-  otaRunning = true;
+      - name: Inyectar WiFi y user_app.cpp
+        env:
+          WIFI_SSID: ${{ github.event.inputs.ssid }}
+          WIFI_PASS: ${{ github.event.inputs.pass }}
+          CODE_B64: ${{ github.event.inputs.code_b64 }}
+        shell: bash
+        run: |
+          mkdir -p sketch
+          echo '#pragma once' > sketch/config_wifi.h
+          echo '#define WIFI_SSID "'$WIFI_SSID'"' >> sketch/config_wifi.h
+          echo '#define WIFI_PASS "'$WIFI_PASS'"' >> sketch/config_wifi.h
+          echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
+          echo "Archivos en sketch después de inyectar user_app:"
+          ls -R sketch
 
-  publishStatus("OTA HTTP START: " + fname);
-  publishStatus("OTA HTTP URL: " + url);
+      - name: Normalizar user_app.cpp (evitar setup/loop duplicados)
+        shell: bash
+        run: |
+          echo "Normalizando user_app.cpp..."
 
-  // LED indicador
-  pinMode(CMD_LED_PIN, OUTPUT);
-  digitalWrite(CMD_LED_PIN, HIGH);
+          if grep -qE '^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "Detectado: void setup() -> renombrando a void UserSetup()"
+            sed -i -E 's/^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(/void UserSetup(/' sketch/user_app.cpp
+          fi
 
-  bool isHttps = url.startsWith("https://");
+          if grep -qE '^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "Detectado: void loop() -> renombrando a void UserLoop()"
+            sed -i -E 's/^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(/void UserLoop(/' sketch/user_app.cpp
+          fi
 
-  WiFiClient* stream = nullptr;
+          if ! grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "ERROR: user_app.cpp no define UserSetup()."
+            exit 1
+          fi
 
-  WiFiClientSecure httpsClient;
-  WiFiClient httpClient;
+          if ! grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp; then
+            echo "ERROR: user_app.cpp no define UserLoop()."
+            exit 1
+          fi
 
-  HTTPClient http;
+          echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-  if (isHttps) {
-    httpsClient.setInsecure(); // Render / HTTPS sin CA
-    if (!http.begin(httpsClient, url)) {
-      publishStatus("OTA ERROR: http.begin(https) failed");
-      digitalWrite(CMD_LED_PIN, LOW);
-      otaRunning = false;
-      return;
-    }
-  } else {
-    if (!http.begin(httpClient, url)) {
-      publishStatus("OTA ERROR: http.begin(http) failed");
-      digitalWrite(CMD_LED_PIN, LOW);
-      otaRunning = false;
-      return;
-    }
-  }
+      - name: Compilar sketch (build-path + build-cache)
+        shell: bash
+        run: |
+          mkdir -p "${BUILD_PATH}" "${BUILD_CACHE_DIR}"
+          arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
+            --output-dir build \
+            --build-path "${BUILD_PATH}" \
+            --build-cache-path "${BUILD_CACHE_DIR}"
+          echo "Contenido de build/"
+          ls -la build
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    publishStatus("OTA ERROR: HTTP " + String(code));
-    http.end();
-    digitalWrite(CMD_LED_PIN, LOW);
-    otaRunning = false;
-    return;
-  }
+      - name: Preparar firmware como archivo de salida
+        shell: bash
+        run: |
+          BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
 
-  int total = http.getSize();
-  stream = http.getStreamPtr();
-  if (!stream) {
-    publishStatus("OTA ERROR: stream null");
-    http.end();
-    digitalWrite(CMD_LED_PIN, LOW);
-    otaRunning = false;
-    return;
-  }
+          if [ -z "$BIN_PATH" ]; then
+            BIN_PATH=$(find build -maxdepth 1 -type f -name "*.bin" \
+              ! -name "*bootloader*" ! -name "*partitions*" | head -n 1)
+          fi
 
-  if (!Update.begin(total > 0 ? total : UPDATE_SIZE_UNKNOWN)) {
-    publishStatus("OTA ERROR: Update.begin failed err=" + String(Update.getError()));
-    http.end();
-    digitalWrite(CMD_LED_PIN, LOW);
-    otaRunning = false;
-    return;
-  }
+          echo "BIN_PATH=$BIN_PATH"
+          if [ -z "$BIN_PATH" ]; then
+            echo "No se encontró firmware .bin en build/"
+            ls -la build
+            exit 1
+          fi
 
-  publishStatus("OTA HTTP: descargando y escribiendo...");
+          mkdir -p out
+          cp "$BIN_PATH" out/firmware.bin
+          echo "Firmware final:"
+          ls -la out/firmware.bin
 
-  // Buffer grande: 16KB (puedes probar 32768 si tu RAM lo permite cómodo)
-  static uint8_t buf[16384];
-
-  unsigned long lastProg = 0;
-  int writtenTotal = 0;
-
-  while (http.connected()) {
-    size_t avail = stream->available();
-    if (!avail) {
-      delay(1);
-      continue;
-    }
-
-    int toRead = (avail > sizeof(buf)) ? sizeof(buf) : (int)avail;
-    int n = stream->readBytes(buf, toRead);
-    if (n <= 0) break;
-
-    size_t w = Update.write(buf, n);
-    writtenTotal += (int)w;
-
-    // Progreso cada ~500ms para no spamear
-    if (millis() - lastProg > 500) {
-      lastProg = millis();
-      if (total > 0) {
-        Serial.printf("[OTA] %d / %d\n", writtenTotal, total);
-      } else {
-        Serial.printf("[OTA] %d\n", writtenTotal);
-      }
-    }
-  }
-
-  if (!Update.end(true)) {
-    publishStatus("OTA ERROR: Update.end failed err=" + String(Update.getError()));
-    http.end();
-    digitalWrite(CMD_LED_PIN, LOW);
-    otaRunning = false;
-    return;
-  }
-
-  http.end();
-
-  publishStatus("OTA OK ✅ Reiniciando...");
-  delay(500);
-  ESP.restart();
-}
-
-// ---------- Parse mensaje OTA HTTP ----------
-// HTTP|<url>|<size>|<sha256>|<filename>
-bool parseHttpOtaMsg(const String& msg, String& url, String& fname) {
-  if (!msg.startsWith("HTTP|")) return false;
-
-  int p1 = msg.indexOf('|');
-  int p2 = msg.indexOf('|', p1 + 1);
-  int p3 = msg.indexOf('|', p2 + 1);
-  int p4 = msg.indexOf('|', p3 + 1);
-  if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
-
-  url = msg.substring(p1 + 1, p2);
-  // size (p2-p3) y sha (p3-p4) no los usamos aquí
-  fname = msg.substring(p4 + 1);
-
-  url.trim();
-  fname.trim();
-
-  if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
-
-  return true;
-}
-
-// ---------- MQTT callback ----------
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String t(topic);
-
-  String msg;
-  msg.reserve(length);
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  msg.trim();
-
-  if (t == T("comandos")) {
-    publishLog("CMD RX: " + msg);
-    if (msg == "LED_ON")  digitalWrite(CMD_LED_PIN, HIGH);
-    if (msg == "LED_OFF") digitalWrite(CMD_LED_PIN, LOW);
-    return;
-  }
-
-  if (t == T("ota/http")) {
-    if (otaRunning) {
-      publishStatus("OTA ya en curso, ignoro nuevo mensaje.");
-      return;
-    }
-
-    String url, fname;
-    if (!parseHttpOtaMsg(msg, url, fname)) {
-      publishStatus("OTA ERROR: mensaje HTTP inválido");
-      return;
-    }
-
-    doHttpUpdate(url, fname);
-    return;
-  }
-}
-
-// ---------- WiFi / MQTT ----------
-void setup_wifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando WiFi");
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\nWiFi conectado ✅");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
-  publishStatus("WIFI OK IP=" + WiFi.localIP().toString(), true);
-}
-
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Conectando MQTT... ");
-    String clientId = "ESP32_HTTPUPDATE_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-
-    bool ok = client.connect(
-      clientId.c_str(),
-      T("status").c_str(), 0, true, "OFFLINE ❌"
-    );
-
-    if (ok) {
-      Serial.println("OK ✅");
-      client.subscribe(T("comandos").c_str());
-      client.subscribe(T("ota/http").c_str());
-      publishStatus("ONLINE HTTPUPDATE ✅ BaseTopic=" + String(BaseTopic), true);
-    } else {
-      Serial.print("Fallo rc="); Serial.print(client.state());
-      Serial.println(" reintento 3s...");
-      delay(3000);
-    }
-  }
-}
-
-// ---------- Implementaciones CoreSetup/CoreLoop ----------
-void CoreSetup() {
-  Serial.begin(115200);
-  delay(200);
-
-  pinMode(CMD_LED_PIN, OUTPUT);
-  digitalWrite(CMD_LED_PIN, LOW);
-
-  setup_wifi();
-
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-  client.setBufferSize(MQTT_MAX_PACKET_SIZE);
-
-  Serial.println("ESP32 CORE_OTA listo...");
-}
-
-void CoreLoop() {
-  if (!client.connected() && !otaRunning) reconnect();
-  if (!otaRunning) client.loop();
-
-  static unsigned long lastHb = 0;
-  if (!otaRunning && millis() - lastHb > 5000) {
-    lastHb = millis();
-    publishStatus("HB milis=" + String(millis()), true);
-  }
-}
+      - name: Subir firmware como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/firmware.bin
