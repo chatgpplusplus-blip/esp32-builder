@@ -9,29 +9,7 @@
 #include "PubSubClient.h"
 #include "config_wifi.h"
 
-// ================== Topics ==================
-
-static String baseTopic;
-static String topicStatus;
-
-// Escucharemos varias variantes por si el backend cambia el topic
-static String topicCmd1;  // .../comandos
-static String topicCmd2;  // .../command
-static String topicCmd3;  // .../ota
-static String topicCmd4;  // .../ota_http;
-
-// Helper para construir topics
-static inline String T(const char* suffix) {
-  return baseTopic + "/" + suffix;
-}
-
-static inline String fileNameFromUrl(const String& url) {
-  int s = url.lastIndexOf('/');
-  if (s < 0) return "firmware.bin";
-  return url.substring(s + 1);
-}
-
-// ================== MQTT / estado global ==================
+// ================== MQTT / Topics ==================
 
 static WiFiClient mqttNet;
 static PubSubClient mqtt(mqttNet);
@@ -39,13 +17,31 @@ static PubSubClient mqtt(mqttNet);
 static bool otaRunning = false;
 static unsigned long lastHb = 0;
 
-// ================== Helpers de log ==================
+static String baseTopic;
+static String topicStatus;
+static String topicLog;
+static String topicCmd;
+static String topicOtaHttp;
 
-static void publishStatus(const String& msg) {
+static inline String T(const char* tail) {
+  return baseTopic + "/" + tail;
+}
+
+// ================== Helpers log ==================
+
+static void publishStatus(const String& msg, bool retain = true) {
   Serial.println("[STATUS] " + msg);
   if (mqtt.connected()) {
-    mqtt.publish(topicStatus.c_str(), msg.c_str(), true);
+    mqtt.publish(topicStatus.c_str(), msg.c_str(), retain);
     Serial.println("[MQTT] " + topicStatus + " -> " + msg);
+  }
+}
+
+static void publishLog(const String& msg) {
+  Serial.println("[LOG] " + msg);
+  if (mqtt.connected()) {
+    mqtt.publish(topicLog.c_str(), msg.c_str(), false);
+    Serial.println("[MQTT] " + topicLog + " -> " + msg);
   }
 }
 
@@ -60,69 +56,55 @@ static bool connectWiFi(unsigned long timeoutMs = 20000UL) {
 
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    delay(200);
+    delay(500);
+    Serial.print(".");
     if (millis() - t0 > timeoutMs) {
-      Serial.println("WiFi TIMEOUT ❌");
+      Serial.println("\nWiFi TIMEOUT ❌");
       return false;
     }
   }
 
-  Serial.println("WiFi conectado ✅");
+  Serial.println("\nWiFi conectado ✅");
   Serial.print("IP: ");
   Serial.println(WiFi.localIP());
-  publishStatus("WIFI OK IP=" + WiFi.localIP().toString());
+  publishStatus("WIFI OK IP=" + WiFi.localIP().toString(), true);
   return true;
 }
 
-// ================== MQTT (forward del callback) ==================
+// ================== OTA: parse de mensaje HTTP|url|size|sha|file ==================
 
-static void mqttCallback(char* topic, byte* payload, unsigned int length);
+static bool parseHttpOtaMsg(const String& msg, String& url, size_t& sz, String& fname) {
+  if (!msg.startsWith("HTTP|")) return false;
 
-static void ensureMqtt() {
-  if (mqtt.connected()) return;
+  int p1 = msg.indexOf('|');
+  int p2 = msg.indexOf('|', p1 + 1);
+  int p3 = msg.indexOf('|', p2 + 1);
+  int p4 = msg.indexOf('|', p3 + 1);
+  if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) return false;
 
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
+  url = msg.substring(p1 + 1, p2);
+  String sizeStr = msg.substring(p2 + 1, p3);
+  // sha = msg.substring(p3 + 1, p4); // ahora mismo no lo usamos
+  fname = msg.substring(p4 + 1);
 
-  String clientId = String("esp32-") + DEVICE_ID + "-" +
-                    String((uint32_t)ESP.getEfuseMac(), HEX);
+  url.trim();
+  fname.trim();
 
-  Serial.print("Conectando MQTT... ");
-  bool ok;
-  if (String(MQTT_USER).length() > 0) {
-    ok = mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS);
-  } else {
-    ok = mqtt.connect(clientId.c_str());
-  }
+  long s = sizeStr.toInt();
+  if (s <= 0) return false;
+  sz = (size_t)s;
 
-  if (ok) {
-    Serial.println("OK ✅");
+  if (!url.startsWith("http://") && !url.startsWith("https://")) return false;
 
-    // Suscribir a varios topics candidatos
-    mqtt.subscribe(topicCmd1.c_str());
-    mqtt.subscribe(topicCmd2.c_str());
-    mqtt.subscribe(topicCmd3.c_str());
-    mqtt.subscribe(topicCmd4.c_str());
-
-    Serial.println("[MQTT] Subscribed to:");
-    Serial.println("  " + topicCmd1);
-    Serial.println("  " + topicCmd2);
-    Serial.println("  " + topicCmd3);
-    Serial.println("  " + topicCmd4);
-
-    publishStatus("ONLINE HTTPUPDATE ✅ BaseTopic=" + baseTopic);
-  } else {
-    Serial.println("FAIL");
-  }
+  return true;
 }
 
-// ================== OTA HTTP manual ==================
+// ================== OTA HTTP manual (HTTPClient + Update) ==================
 
-static bool otaHttpUpdate(const String& url) {
+static bool otaHttpUpdate(const String& url, size_t expectedSize, const String& fname) {
   otaRunning = true;
 
-  const String fname = fileNameFromUrl(url);
-  publishStatus("OTA HTTP START: " + fname);
+  publishStatus("OTA HTTP START: " + fname + " (" + String(expectedSize) + " bytes)");
   publishStatus("OTA HTTP URL: " + url);
 
   WiFiClientSecure client;
@@ -154,7 +136,10 @@ static bool otaHttpUpdate(const String& url) {
     publishStatus("OTA HTTP: size desconocido (chunked)");
   }
 
-  if (!Update.begin(contentLen > 0 ? (size_t)contentLen : UPDATE_SIZE_UNKNOWN)) {
+  // Si el servidor te promete un tamaño, podemos comparar luego
+  size_t beginSize = (contentLen > 0) ? (size_t)contentLen : UPDATE_SIZE_UNKNOWN;
+
+  if (!Update.begin(beginSize)) {
     publishStatus("OTA FAIL: Update.begin err=" + String(Update.getError()));
     http.end();
     otaRunning = false;
@@ -208,7 +193,6 @@ static bool otaHttpUpdate(const String& url) {
         }
       }
     } else {
-      // sin datos disponibles
       if (contentLen <= 0 && !http.connected()) {
         break;
       }
@@ -228,6 +212,7 @@ static bool otaHttpUpdate(const String& url) {
 
   http.end();
 
+  // Comprobación con content-length y con expectedSize (del mensaje)
   if (contentLen > 0 && written != (size_t)contentLen) {
     publishStatus("OTA FAIL: size mismatch " +
                   String((unsigned)written) + "/" +
@@ -235,6 +220,13 @@ static bool otaHttpUpdate(const String& url) {
     Update.abort();
     otaRunning = false;
     return false;
+  }
+
+  if (expectedSize > 0 && written != expectedSize) {
+    publishStatus("OTA WARN: esperado=" +
+                  String((unsigned)expectedSize) + " escrito=" +
+                  String((unsigned)written));
+    // No abortamos; sólo avisamos
   }
 
   if (!Update.end(true)) {
@@ -257,8 +249,58 @@ static bool otaHttpUpdate(const String& url) {
   Serial.flush();
   delay(200);
 
-  ESP.restart();   // ← aquí ya no hay que esperar 6 minutos
-  return true;     // (prácticamente no se ejecuta nunca tras el restart)
+  ESP.restart();        // no deberías volver de aquí
+  return true;          // por si acaso
+}
+
+// ================== MQTT ==================
+
+static void mqttCallback(char* topic, byte* payload, unsigned int length);
+
+static void ensureMqtt() {
+  if (mqtt.connected() || otaRunning) return;
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(MQTT_MAX_PACKET_SIZE);
+
+  while (!mqtt.connected() && !otaRunning) {
+    Serial.print("Conectando MQTT... ");
+    String clientId = String("ESP32_HTTPUPDATE_") +
+                      String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    bool ok;
+    if (String(MQTT_USER).length() > 0) {
+      ok = mqtt.connect(
+        clientId.c_str(),
+        topicStatus.c_str(), 0, true,
+        "OFFLINE ❌"
+      );
+    } else {
+      ok = mqtt.connect(
+        clientId.c_str(),
+        topicStatus.c_str(), 0, true,
+        "OFFLINE ❌"
+      );
+    }
+
+    if (ok) {
+      Serial.println("OK ✅");
+      mqtt.subscribe(topicCmd.c_str());
+      mqtt.subscribe(topicOtaHttp.c_str());
+
+      Serial.println("[MQTT] Subscribed to:");
+      Serial.println("  " + topicCmd);
+      Serial.println("  " + topicOtaHttp);
+
+      publishStatus("ONLINE HTTPUPDATE ✅ BaseTopic=" + baseTopic, true);
+    } else {
+      Serial.print("Fallo rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" reintento 3s...");
+      delay(3000);
+    }
+  }
 }
 
 // ================== MQTT callback ==================
@@ -275,48 +317,54 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.println("[MQTT CB] topic=" + t);
   Serial.println("[MQTT CB] payload=" + msg);
 
-  bool isCmdTopic =
-    (t == topicCmd1 || t == topicCmd2 || t == topicCmd3 || t == topicCmd4);
+  // Comandos simples (LED_ON / LED_OFF)
+  if (t == topicCmd) {
+    publishLog("CMD RX: " + msg);
 
-  if (!isCmdTopic) {
-    // Mensajes de otros topics se ignoran
+    if (msg == "LED_ON") {
+      pinMode(CORE_LED_PIN, OUTPUT);
+      digitalWrite(CORE_LED_PIN, HIGH);
+    } else if (msg == "LED_OFF") {
+      pinMode(CORE_LED_PIN, OUTPUT);
+      digitalWrite(CORE_LED_PIN, LOW);
+    }
+
     return;
   }
 
-  publishStatus("CMD RX: " + msg);
-
-  String url = msg;
-
-  // Permitir "OTA <url>"
-  if (msg.startsWith("OTA ") || msg.startsWith("ota ")) {
-    url = msg.substring(4);
-    url.trim();
-  }
-
-  if (url.startsWith("http://") || url.startsWith("https://")) {
-    if (!otaRunning) {
-      otaHttpUpdate(url);
-    } else {
-      publishStatus("OTA ya en progreso...");
+  // OTA HTTP: topic EXACTO: baseTopic + "/ota/http"
+  if (t == topicOtaHttp) {
+    if (otaRunning) {
+      publishStatus("OTA ya en curso, ignoro nuevo mensaje.");
+      return;
     }
-  } else {
-    publishStatus("CMD ignorado (no URL)");
+
+    String url, fname;
+    size_t sz = 0;
+    if (!parseHttpOtaMsg(msg, url, sz, fname)) {
+      publishStatus("OTA ERROR: mensaje HTTP inválido");
+      return;
+    }
+
+    otaHttpUpdate(url, sz, fname);
+    return;
   }
 }
 
-// ================== API pública (lo que llama tu sketch) ==================
+// ================== API pública ==================
 
 void CoreOtaSetup() {
   Serial.begin(115200);
   delay(200);
 
-  baseTopic   = String(BASE_TOPIC_PREFIX) + "/" + DEVICE_ID;
-  topicStatus = T("status");
+  pinMode(CORE_LED_PIN, OUTPUT);
+  digitalWrite(CORE_LED_PIN, LOW);
 
-  topicCmd1   = baseTopic + "/comandos";
-  topicCmd2   = baseTopic + "/command";
-  topicCmd3   = baseTopic + "/ota";
-  topicCmd4   = baseTopic + "/ota_http";
+  baseTopic    = String(BASE_TOPIC_PREFIX) + "/" + DEVICE_ID;
+  topicStatus  = T("status");
+  topicLog     = T("log");
+  topicCmd     = T("comandos");
+  topicOtaHttp = baseTopic + "/ota/http";   // IMPORTANTE: igual que tu código base
 
   Serial.println("=== CORE_OTA INIT ===");
   Serial.println("BaseTopic: " + baseTopic);
@@ -328,28 +376,28 @@ void CoreOtaSetup() {
     ESP.restart();
   }
 
-  publishStatus("ESP32 CORE_OTA listo...");
+  publishStatus("ESP32 CORE_OTA listo...", true);
   ensureMqtt();
 }
 
 void CoreOtaLoop() {
-  // Nota: otaHttpUpdate es síncrono; mientras está corriendo,
-  // no volvemos a entrar aquí hasta que termina o hace restart.
+  // Si hay OTA en curso, no hacemos nada más
+  if (otaRunning) {
+    return;
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
 
   ensureMqtt();
-  mqtt.loop();
+  if (mqtt.connected()) {
+    mqtt.loop();
+  }
 
   // Heartbeat
   if (millis() - lastHb >= HEARTBEAT_MS) {
     lastHb = millis();
-    publishStatus("HB milis=" + String(millis()));
+    publishStatus("HB milis=" + String(millis()), true);
   }
-
-  // La lógica de usuario la sigues llamando tú en loop():
-  //   CoreOtaLoop();
-  //   UserLoop();
 }
