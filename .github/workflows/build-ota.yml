@@ -18,52 +18,61 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ARDUINO_CLI_VERSION: "1.2.0"
+      ARDUINO_CLI_VERSION: "0.35.3"
       ESP32_CORE_VERSION: "3.3.6"
-      BUILD_PATH: ".arduino-build"
       BUILD_CACHE_DIR: ".arduino-build-cache"
-      # Puedes ajustar esto:
-      BUILD_JOBS: "4"   # o "0" para auto
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # Cache: toolchain/core "pesado"
-      - name: Cache ESP32 toolchain + core (lean)
+      # Cache lean: SOLO lo instalado (evita staging gigante)
+      - name: Cache ESP32 packages (lean)
+        id: cache_toolchain
         uses: actions/cache@v4
         with:
           path: |
             ~/.arduino15/packages
-            ~/.arduino15/staging
-            ~/.cache/arduino
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-arduino-cli-${{ env.ARDUINO_CLI_VERSION }}-lean-v1
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-lean-v2
 
-      # Cache: build intermedio (pequeño)
-      - name: Cache Arduino build artifacts
+      # Cache pequeño: build-cache (NO cachear build-path)
+      - name: Cache Arduino build-cache (small)
+        id: cache_build
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.BUILD_PATH }}
-            ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache-lean-v1
+          path: ${{ env.BUILD_CACHE_DIR }}
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache-lean-v2
+
+      - name: Show cache hits
+        run: |
+          echo "toolchain cache-hit = ${{ steps.cache_toolchain.outputs.cache-hit }}"
+          echo "build cache-hit     = ${{ steps.cache_build.outputs.cache-hit }}"
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
           version: ${{ env.ARDUINO_CLI_VERSION }}
 
-      - name: Setup ESP32 core (skip if already installed)
+      - name: Setup ESP32 core (self-heal tools)
         shell: bash
         run: |
           set -e
           arduino-cli config init || true
           arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
+          CORE_OK=false
           if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
+            CORE_OK=true
+          fi
+
+          # Si falta esp32-libs, la propiedad runtime.tools.esp32-libs.path queda sin resolver y explota el build.
+          LIBS_ELF=$(find "$HOME/.arduino15/packages/esp32" -path "*esp32-libs*" -name "bootloader_qio_80m.elf" -print -quit 2>/dev/null || true)
+
+          if [ "$CORE_OK" = true ] && [ -n "$LIBS_ELF" ]; then
             echo "ESP32 core ${ESP32_CORE_VERSION} ya instalado ✅ (cache hit)"
+            echo "bootloader elf OK: $LIBS_ELF"
           else
-            echo "Core no encontrado -> update-index + install..."
+            echo "Instalando / reparando core + tools..."
             arduino-cli core update-index
             arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
           fi
@@ -75,58 +84,74 @@ jobs:
           CODE_B64: ${{ github.event.inputs.code_b64 }}
         shell: bash
         run: |
+          set -e
           mkdir -p sketch
-          echo '#pragma once' > sketch/config_wifi.h
-          echo '#define WIFI_SSID "'$WIFI_SSID'"' >> sketch/config_wifi.h
-          echo '#define WIFI_PASS "'$WIFI_PASS'"' >> sketch/config_wifi.h
+
+          cat > sketch/config_wifi.h <<EOF
+          #pragma once
+          #define WIFI_SSID "${WIFI_SSID}"
+          #define WIFI_PASS "${WIFI_PASS}"
+          EOF
+
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
+
           echo "Archivos en sketch después de inyectar user_app:"
           ls -R sketch
 
       - name: Normalizar user_app.cpp (evitar setup/loop duplicados)
         shell: bash
         run: |
+          set -e
           echo "Normalizando user_app.cpp..."
 
           if grep -qE '^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(' sketch/user_app.cpp; then
-            echo "Detectado: void setup() -> renombrando a void UserSetup()"
+            echo "Detectado setup() -> UserSetup()"
             sed -i -E 's/^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(/void UserSetup(/' sketch/user_app.cpp
           fi
 
           if grep -qE '^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(' sketch/user_app.cpp; then
-            echo "Detectado: void loop() -> renombrando a void UserLoop()"
+            echo "Detectado loop() -> UserLoop()"
             sed -i -E 's/^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(/void UserLoop(/' sketch/user_app.cpp
           fi
 
-          if ! grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp; then
-            echo "ERROR: user_app.cpp no define UserSetup()."
-            exit 1
-          fi
-
-          if ! grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp; then
-            echo "ERROR: user_app.cpp no define UserLoop()."
-            exit 1
-          fi
-
+          grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp
+          grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp
           echo "OK: user_app.cpp expone UserSetup/UserLoop."
 
-      - name: Compilar sketch (build-path + build-cache + jobs)
+      - name: Compilar sketch (con --jobs si existe)
         shell: bash
         run: |
           set -e
-          mkdir -p "${BUILD_PATH}" "${BUILD_CACHE_DIR}"
-          echo "Using jobs=${BUILD_JOBS}"
+          mkdir -p "${BUILD_CACHE_DIR}"
+
+          BUILD_PATH="${RUNNER_TEMP}/arduino-build"
+          mkdir -p "${BUILD_PATH}"
+
+          JOBS=$(nproc)
+          echo "Using jobs=${JOBS}"
+
+          EXTRA=""
+          if arduino-cli compile --help | grep -q -- "--jobs"; then
+            EXTRA="--jobs ${JOBS}"
+            echo "arduino-cli soporta --jobs ✅"
+          else
+            echo "arduino-cli NO soporta --jobs (tu version actual) -> compilando sin paralelismo"
+          fi
+
+          # shellcheck disable=SC2086
           arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
             --output-dir build \
             --build-path "${BUILD_PATH}" \
             --build-cache-path "${BUILD_CACHE_DIR}" \
-            -j "${BUILD_JOBS}"
+            ${EXTRA}
+
           echo "Contenido de build/"
           ls -la build
 
       - name: Preparar firmware como archivo de salida
         shell: bash
         run: |
+          set -e
           BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
 
           if [ -z "$BIN_PATH" ]; then
@@ -135,11 +160,7 @@ jobs:
           fi
 
           echo "BIN_PATH=$BIN_PATH"
-          if [ -z "$BIN_PATH" ]; then
-            echo "No se encontró firmware .bin en build/"
-            ls -la build
-            exit 1
-          fi
+          test -n "$BIN_PATH"
 
           mkdir -p out
           cp "$BIN_PATH" out/firmware.bin
