@@ -3,10 +3,10 @@
 
 void setup() {
   CoreOtaSetup();   // WiFi + MQTT + OTA
-  UserSetup();   // Lógica de aplicación
+  UserSetup();      // Lógica de aplicación
 }
 
 void loop() {
   CoreOtaLoop();    // Heartbeat, MQTT, OTA
-  UserLoop();    // Tu lógica (setup/loop de aplicación)
+  UserLoop();       // Tu lógica
 }
