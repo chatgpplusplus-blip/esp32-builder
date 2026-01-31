@@ -9,6 +9,7 @@
   #define BASE_TOPIC_PREFIX "bari/esp32"
 #endif
 
+// === MQTT broker ===
 #ifndef MQTT_HOST
   #define MQTT_HOST "broker.emqx.io"
 #endif
@@ -29,20 +30,21 @@
   #define HEARTBEAT_MS 5000UL
 #endif
 
-// OTA tuning (enfocado en throughput)
+// OTA tuning
 #ifndef OTA_READ_TIMEOUT_MS
-  #define OTA_READ_TIMEOUT_MS 12000UL
+  #define OTA_READ_TIMEOUT_MS 8000UL
 #endif
 
 #ifndef OTA_STALL_TIMEOUT_MS
-  #define OTA_STALL_TIMEOUT_MS 8000UL
+  #define OTA_STALL_TIMEOUT_MS 6000UL
 #endif
 
-// ⬆️ Buffer más grande = menos iteraciones = más rápido
+// Puedes subir a 32768 si tienes RAM suficiente
 #ifndef OTA_BUF_SIZE
-  #define OTA_BUF_SIZE 32768   // 32 KB
+  #define OTA_BUF_SIZE 16384   // 16 KB
 #endif
 
+// Igual que en tu define para soportar mensajes grandes
 #ifndef MQTT_MAX_PACKET_SIZE
   #define MQTT_MAX_PACKET_SIZE 2048
 #endif
