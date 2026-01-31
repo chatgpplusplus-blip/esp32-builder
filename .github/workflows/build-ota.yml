@@ -22,32 +22,27 @@ jobs:
       ESP32_CORE_VERSION: "3.3.6"
 
     steps:
-      # 1) Checkout mínimo (sparse) para que no tarde 15–20s en traer todo el repo
-      - name: Checkout repo (solo lo necesario)
+      # 1) Checkout solo lo necesario (sin patrones con *)
+      - name: Checkout repo (solo sketch)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          # Ajusta esta lista según cómo esté estructurado tu repo
+          # TODO: ajusta a cómo está tu repo, pero si todo está en /sketch, esto basta
           sparse-checkout: |
             sketch
-            core_ota.*
-            PubSubClient.*
-            user_app.*
-            config_wifi.h
-            .github/workflows
           sparse-checkout-cone-mode: true
 
-      # 2) Cache del core ESP32 (toolchains, etc.)
+      # 2) Cache del core ESP32 (más pequeño: solo esp32 + staging)
       - name: Cache ESP32 packages
         id: cache_packages
         uses: actions/cache@v4
         with:
           path: |
-            ~/.arduino15/packages
+            ~/.arduino15/packages/esp32
+            ~/.arduino15/staging
           key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-fast-v3
 
-      # 3) Cache del build cache global de Arduino (cores + sketches)
-      #    Aquí es donde se va a notar la diferencia a partir del segundo build
+      # 3) Cache del build cache global de Arduino (cores precompilados + sketch)
       - name: Cache Arduino build cache
         id: cache_build
         uses: actions/cache@v4
@@ -61,7 +56,7 @@ jobs:
         with:
           version: ${{ env.ARDUINO_CLI_VERSION }}
 
-      # 5) Instalar / reparar core ESP32 (si no está ya en cache_packages)
+      # 5) Instalar / reparar core ESP32 si no está en cache
       - name: Setup ESP32 core (repair if needed)
         shell: bash
         run: |
@@ -78,13 +73,13 @@ jobs:
             arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
           fi
 
-          # Fix por si falta esp32-libs (bootloader_qio_80m.elf, etc.)
+          # Reparar esp32-libs si falta (bootloader, etc.)
           if ! find "$HOME/.arduino15/packages/esp32" -path "*esp32-libs*" -name "bootloader_qio_80m.elf" -print -quit | grep -q .; then
             echo "esp32-libs missing -> reinstall core tools"
             arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION} --overwrite
           fi
 
-      # 6) Inyectar WiFi y user_app.cpp
+      # 6) Inyectar WiFi y user_app.cpp (en el directorio sketch)
       - name: Inyectar WiFi y user_app.cpp
         shell: bash
         env:
@@ -101,7 +96,7 @@ jobs:
           EOF
           echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
 
-      # 7) Normalizar (por si el user mandó setup/loop en vez de UserSetup/UserLoop)
+      # 7) Normalizar setup/loop -> UserSetup/UserLoop (por si lo mandas estilo Arduino IDE)
       - name: Normalizar user_app.cpp (setup/loop -> UserSetup/UserLoop)
         shell: bash
         run: |
@@ -118,7 +113,7 @@ jobs:
       # 8) Compilar usando:
       #    - cache global (~/.cache/arduino)
       #    - todos los cores (--jobs 0)
-      #    - SIN --build-path (para que el caché funcione)
+      #    - SIN --build-path ni --build-cache-path (para que el cache funcione)
       - name: Compilar sketch (rápido, usando cache global)
         shell: bash
         run: |
@@ -131,7 +126,7 @@ jobs:
 
           ls -la build
 
-      # 9) Preparar firmware.bin
+      # 9) Preparar firmware.bin para OTA
       - name: Preparar firmware
         shell: bash
         run: |
@@ -142,7 +137,7 @@ jobs:
           cp "$BIN_PATH" out/firmware.bin
           ls -la out/firmware.bin
 
-      # 10) Subir artifact (igual que antes)
+      # 10) Subir artifact
       - name: Subir artifact
         uses: actions/upload-artifact@v4
         with:
