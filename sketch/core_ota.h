@@ -41,7 +41,7 @@
 
 // Puedes subir a 32768 si tienes RAM suficiente
 #ifndef OTA_BUF_SIZE
-  #define OTA_BUF_SIZE 16384   // 16 KB
+  #define OTA_BUF_SIZE 32768   // 16 KB
 #endif
 
 // Igual que en tu define para soportar mensajes grandes
