@@ -1,131 +1,142 @@
-name: Build ESP32 OTA firmware
+name: build
+run-name: ota build ${{ inputs.trace_id || github.run_id }}
 
 on:
   workflow_dispatch:
     inputs:
-      code_b64:
-        description: "Contenido de user_app.cpp en Base64"
+      trace_id:
+        description: "id desde la web/app"
+        required: false
+        default: ""
+      wifi_ssid:
         required: true
-      ssid:
-        description: "WiFi SSID"
+      wifi_pass:
         required: true
-      pass:
-        description: "WiFi password"
+      mqtt_host:
+        required: true
+      mqtt_user:
+        required: true
+      mqtt_pass:
+        required: true
+      user_app_b64:
         required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     env:
-      ARDUINO_CLI_VERSION: "1.4.1"
       ESP32_CORE_VERSION: "3.3.6"
-      BUILD_CACHE_DIR: ".arduino-build-cache"
+      ARDUINO_CLI_VERSION: "1.4.1"
+      # Forzamos XDG para que el build cache vaya a un path estable
+      XDG_CACHE_HOME: /home/runner/.cache
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (más rápido)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          # Ajusta esto a tu repo: incluye solo lo necesario
+          sparse-checkout: |
+            sketch
+            .github/workflows
 
-      # Cache ESP32 packages
-      - name: Cache ESP32 packages
-        id: cache_packages
+      # Cache SOLO del core ESP32 (tools + hardware)
+      - name: Cache ESP32 core/tools
         uses: actions/cache@v4
         with:
           path: |
-            ~/.arduino15/packages
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-fast-v2
+            ~/.arduino15/packages/esp32
+            ~/.arduino15/staging
+            ~/.arduino15/package*_index.json*
+          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-v3
 
-      # Cache build-cache (core.a, etc.)
-      - name: Cache build-cache
-        id: cache_build
+      # Cache del build cache incremental (lo que te baja el tiempo de compile en runs siguientes)
+      - name: Cache Arduino build cache
         uses: actions/cache@v4
         with:
           path: |
-            ${{ env.BUILD_CACHE_DIR }}
-          key: ${{ runner.os }}-esp32core-${{ env.ESP32_CORE_VERSION }}-buildcache-cli-${{ env.ARDUINO_CLI_VERSION }}-fast-v2
+            /home/runner/.cache/arduino
+          key: ${{ runner.os }}-arduinobuildcache-${{ env.ESP32_CORE_VERSION }}-cli-${{ env.ARDUINO_CLI_VERSION }}-v3
 
-      - name: Install Arduino CLI
+      - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
           version: ${{ env.ARDUINO_CLI_VERSION }}
 
-      - name: Setup ESP32 core (repair if needed)
+      - name: Configure Arduino build cache path (IMPORTANTE)
         shell: bash
         run: |
           set -e
-          arduino-cli config init || true
-          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli config init --overwrite
+          # En CLI moderno, el build cache se define por config (no por --build-cache-path)
+          arduino-cli config set build_cache.path "/home/runner/.cache/arduino"
+          echo "build_cache.path=$(arduino-cli config get build_cache.path)"
 
-          if arduino-cli core list | grep -qE "esp32:esp32[[:space:]]+${ESP32_CORE_VERSION}"; then
-            echo "ESP32 core ${ESP32_CORE_VERSION} OK ✅"
-          else
-            echo "Installing core..."
-            arduino-cli core update-index
-            arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
-          fi
-
-          if ! find "$HOME/.arduino15/packages/esp32" -path "*esp32-libs*" -name "bootloader_qio_80m.elf" -print -quit | grep -q .; then
-            echo "esp32-libs missing -> reinstall core tools"
-            arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION} --overwrite
-          fi
-
-      - name: Inyectar WiFi y user_app.cpp
+      - name: Install ESP32 core (si falta)
         shell: bash
-        env:
-          WIFI_SSID: ${{ github.event.inputs.ssid }}
-          WIFI_PASS: ${{ github.event.inputs.pass }}
-          CODE_B64: ${{ github.event.inputs.code_b64 }}
+        run: |
+          set -e
+          arduino-cli core update-index
+          if ! arduino-cli core list | grep -q "esp32:esp32.*${ESP32_CORE_VERSION}"; then
+            arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}"
+          fi
+          echo "ESP32 core ${ESP32_CORE_VERSION} OK ✅"
+
+      # (Opcional) recorta cosas no usadas para bajar el tamaño del cache (solo si tu FQBN es Xtensa)
+      # Úsalo si quieres intentar bajar segundos del restore del cache.
+      - name: (Optional) Strip unused tools to reduce cache
+        shell: bash
+        run: |
+          set -e
+          # OJO: si un día compilas un target RISC-V (C3/C6/H2), esto te rompería.
+          rm -rf ~/.arduino15/packages/esp32/tools/riscv32-esp-elf-gcc || true
+          rm -rf ~/.arduino15/packages/esp32/tools/riscv32-esp-elf-gdb || true
+          # Debug tools que normalmente no usas en CI:
+          rm -rf ~/.arduino15/packages/esp32/tools/openocd-esp32 || true
+
+      - name: Write sketch inputs
+        shell: bash
         run: |
           set -e
           mkdir -p sketch
-          cat > sketch/config_wifi.h <<EOF
+          cat > sketch/config_wifi.h <<'EOF'
           #pragma once
-          #define WIFI_SSID "${WIFI_SSID}"
-          #define WIFI_PASS "${WIFI_PASS}"
+          #define WIFI_SSID "${{ inputs.wifi_ssid }}"
+          #define WIFI_PASS "${{ inputs.wifi_pass }}"
+          #define MQTT_HOST "${{ inputs.mqtt_host }}"
+          #define MQTT_USER "${{ inputs.mqtt_user }}"
+          #define MQTT_PASS "${{ inputs.mqtt_pass }}"
           EOF
-          echo "$CODE_B64" | base64 -d > sketch/user_app.cpp
 
-      - name: Normalizar user_app.cpp (setup/loop -> UserSetup/UserLoop)
+          echo "${{ inputs.user_app_b64 }}" | base64 -d > sketch/user_app.cpp
+
+      - name: Compile (paralelo)
         shell: bash
         run: |
           set -e
-          if grep -qE '^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(' sketch/user_app.cpp; then
-            sed -i -E 's/^[[:space:]]*void[[:space:]]+setup[[:space:]]*\(/void UserSetup(/' sketch/user_app.cpp
-          fi
-          if grep -qE '^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(' sketch/user_app.cpp; then
-            sed -i -E 's/^[[:space:]]*void[[:space:]]+loop[[:space:]]*\(/void UserLoop(/' sketch/user_app.cpp
-          fi
-          grep -qE 'void[[:space:]]+UserSetup[[:space:]]*\(' sketch/user_app.cpp
-          grep -qE 'void[[:space:]]+UserLoop[[:space:]]*\(' sketch/user_app.cpp
-
-      - name: Compilar sketch (parallel)
-        shell: bash
-        run: |
-          set -e
-          mkdir -p "${BUILD_CACHE_DIR}"
-          BUILD_PATH="${RUNNER_TEMP}/arduino-build"
-          mkdir -p "${BUILD_PATH}"
-
-          # --jobs 0 => usa todos los cores disponibles
-          arduino-cli compile --fqbn esp32:esp32:esp32da sketch \
-            --output-dir build \
-            --build-path "${BUILD_PATH}" \
-            --build-cache-path "${BUILD_CACHE_DIR}" \
+          mkdir -p out builddir
+          arduino-cli compile \
+            -b esp32:esp32:esp32da \
+            sketch \
+            --output-dir out \
+            --build-path builddir \
             --jobs 0
 
-          ls -la build
-
-      - name: Preparar firmware
+      - name: Rename firmware
         shell: bash
         run: |
           set -e
-          BIN_PATH=$(find build -maxdepth 1 -type f -name "*sketch.ino.bin" | head -n 1)
-          test -n "$BIN_PATH"
-          mkdir -p out
-          cp "$BIN_PATH" out/firmware.bin
+          # Ajusta el nombre si tu output cambia; este suele ser el .bin principal
+          # En Arduino CLI a veces queda como sketch.ino.bin si hay un .ino.
+          # Si tu proyecto genera otro nombre, lista out/ para confirmarlo.
+          ls -la out
+          # Busca el .bin más grande como "firmware"
+          BIN="$(ls -S out/*.bin | head -n 1)"
+          cp "$BIN" out/firmware.bin
           ls -la out/firmware.bin
 
-      - name: Subir artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware
